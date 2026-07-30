@@ -1,0 +1,175 @@
+# Continuous integration.
+#
+# ────────────────────────────────────────────────────────────────────────────────────────────────
+# THIS FILE IS TEMPORARY. Once `cloudsforge/.github` exists (AD-03) everything below except the
+# `contracts` job is deleted and replaced by a call to the shared reusable workflow. The measured
+# target in docs/ecosystem/03 §5 is zero repositories with a bespoke CI file, so treat every line
+# here as a liability with a deletion date rather than as something to extend.
+#
+# The `contracts` job is the exception: it is specific to this repository and it stays.
+# ────────────────────────────────────────────────────────────────────────────────────────────────
+
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:17-alpine
+        # Not a secret: this database exists for the duration of one job, is reachable only from
+        # it, and holds nothing. A real value here would be a real value in a public log.
+        env:
+          POSTGRES_USER: mint
+          POSTGRES_PASSWORD: mint
+          POSTGRES_DB: mint_test
+        ports: ['5432:5432']
+        options: >-
+          --health-cmd "pg_isready -U mint"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    steps:
+      # Temporary: the three checkouts and the sibling layout exist only because the runtime and
+      # contracts packages are unpublished. On publish this collapses to one checkout.
+      - uses: actions/checkout@v4
+        with: { path: mint }
+      - uses: actions/checkout@v4
+        with: { repository: cloudsforge/micro-runtime, path: runtime }
+      - uses: actions/checkout@v4
+        with: { repository: cloudsforge/micro-contracts, path: contracts }
+
+      - uses: pnpm/action-setup@v4
+        with: { version: 11.9.0 }
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+          cache-dependency-path: mint/pnpm-lock.yaml
+
+      - name: Install
+        working-directory: mint
+        run: pnpm install --frozen-lockfile
+
+      - name: Typecheck
+        working-directory: mint
+        run: pnpm typecheck
+
+      - name: Migrate the test database
+        working-directory: mint
+        # The migrator is exercised as a migrator, on an empty database, exactly as a deploy runs
+        # it. A schema created by the test suite instead would never prove the one-shot job works —
+        # and this service's three CHECK constraints only exist because that job ran.
+        env:
+          MINT_DATABASE_URL: postgres://mint:mint@127.0.0.1:5432/mint_test
+          IDENTITY_JWKS_URL: http://127.0.0.1:4001/.well-known/jwks.json
+          IDENTITY_ISSUER: http://127.0.0.1:4001
+          OUTBOX_SIGNING_SECRET: ci-only-not-a-real-secret-000000000000
+          CUSTODY_URL: http://127.0.0.1:4005
+          INDEXER_URL: http://127.0.0.1:4008
+          LEDGER_URL: http://127.0.0.1:4007
+          MINT_SERVICE_TOKEN: ci-only-not-a-real-token-0000000000000
+        run: pnpm migrate
+
+      - name: Test
+        working-directory: mint
+        env:
+          MINT_TEST_DATABASE_URL: postgres://mint:mint@127.0.0.1:5432/mint_test
+        run: pnpm test
+
+  contracts:
+    name: Committed bytecode reproduces from the source
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+        with: { version: 11.9.0 }
+      - uses: actions/setup-node@v4
+        with: { node-version: 22, cache: pnpm }
+      - run: pnpm install --frozen-lockfile
+
+      # This works because `solc` and `@openzeppelin/contracts` are EXACT-pinned and the install is
+      # frozen. Loosen either pin to a caret range and the job stops proving anything: the
+      # recompile would produce different bytes on a different day and the diff would be noise.
+      - name: Recompile and diff
+        run: |
+          pnpm compile:contracts
+          if ! git diff --exit-code -- src/contracts/generated.ts; then
+            echo '::error::src/contracts/generated.ts does not match src/contracts/ForgeTokens.sol — run `pnpm compile:contracts` and commit the result'
+            exit 1
+          fi
+          echo 'ok: the committed bytecode reproduces from the source'
+
+  # The estate-wide rules from docs/ecosystem/03 §2, as checks rather than as review discipline.
+  rules:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 'Rule 1 — one database, and it is this service''s own'
+        run: |
+          if grep -rnE '[A-Z_]*DATABASE_URL' src/ --include='*.ts' \
+             | grep -vE 'MINT_DATABASE_URL|MINT_TEST_DATABASE_URL'; then
+            echo '::error::a connection string other than MINT_DATABASE_URL is referenced'
+            exit 1
+          fi
+          if grep -rnE '(postgres|postgresql)://' src/ --include='*.ts' | grep -v '\.test\.ts'; then
+            echo '::error::a literal connection string appears outside a test'
+            exit 1
+          fi
+
+      - name: 'Rule 4 — livez, readyz and metrics exist'
+        run: |
+          for endpoint in /livez /readyz /metrics; do
+            grep -q "'$endpoint'" src/server.ts \
+              || { echo "::error::$endpoint is not served"; exit 1; }
+          done
+
+      - name: 'Rule 7 — migrations are never run by the service process'
+        run: |
+          if grep -nE '\bmigrate\(' src/index.ts; then
+            echo '::error::index.ts calls migrate — that is the migrator job, not the service'
+            exit 1
+          fi
+
+      - name: 'Rule 8 — every background timer is a leased job'
+        # Comment lines are excluded: this repository DISCUSSES the frozen service's timers, and a
+        # check that cannot tell a timer from a sentence about one is a check people learn to
+        # ignore.
+        run: |
+          if grep -rnE '\bset(Interval|Timeout)\(' src/ --include='*.ts' \
+             | grep -v '\.test\.ts' \
+             | grep -vE '^[^:]+:[0-9]+: *(//|\*)'; then
+            echo '::error::a timer was found; background work is a leased job (@cloudsforge/jobs)'
+            exit 1
+          fi
+
+      # The deploy must not be able to crawl back inside the request. This is the defect the whole
+      # service exists to fix and it is cheap to assert.
+      - name: 'The deploy route answers 202 and enqueues'
+        run: |
+          grep -q 'status: 202' src/server.ts \
+            || { echo '::error::the deploy route no longer answers 202'; exit 1; }
+
+      # A `*/` in the MIDDLE of a block comment terminates it early and silently uncomments
+      # whatever follows. The pattern matches a continuation line of a block comment (leading `*`)
+      # that carries a `*/` with more text after it — which is the only shape that does damage.
+      # A single-line `/** … */` is fine and is not matched.
+      - name: 'No comment-terminating sequence inside a block comment'
+        run: |
+          if grep -rnE '^\s*\*.*\*/.+' src/ --include='*.ts'; then
+            echo '::error::a */ appears mid-way through a block comment and terminates it early'
+            exit 1
+          fi
