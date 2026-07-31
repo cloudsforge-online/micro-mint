@@ -59,6 +59,16 @@ jobs:
           cache: pnpm
           cache-dependency-path: mint/pnpm-lock.yaml
 
+      # `link:` resolves to the sibling's own node_modules, so the siblings must be installed
+      # before this repository is — without this, `tsc` cannot resolve the sibling source it
+      # typechecks (jose, @opentelemetry/api, @cloudsforge/contracts-chain) and `tsx` cannot load
+      # @cloudsforge/* at run time.
+      - name: Install the sibling runtime and contracts
+        run: |
+          set -euo pipefail
+          pnpm --dir runtime install --frozen-lockfile
+          pnpm --dir contracts install --frozen-lockfile
+
       - name: Install
         working-directory: mint
         run: pnpm install --frozen-lockfile
