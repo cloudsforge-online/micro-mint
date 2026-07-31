@@ -47,9 +47,9 @@ jobs:
       - uses: actions/checkout@v4
         with: { path: mint }
       - uses: actions/checkout@v4
-        with: { repository: cloudsforge/micro-runtime, path: runtime }
+        with: { repository: cloudsforge-online/micro-runtime, path: runtime, token: "${{ secrets.ESTATE_READ_TOKEN }}" }
       - uses: actions/checkout@v4
-        with: { repository: cloudsforge/micro-contracts, path: contracts }
+        with: { repository: cloudsforge-online/micro-contracts, path: contracts, token: "${{ secrets.ESTATE_READ_TOKEN }}" }
 
       - uses: pnpm/action-setup@v4
         with: { version: 11.9.0 }
