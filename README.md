@@ -201,7 +201,7 @@ and `MINT_SERVICE_TOKEN` ship **empty**, so a copied file refuses to boot until 
 | --- | --- | --- | --- |
 | `micro-ledger` | `POST /entries` (`src/ledgerclient.ts:148`) | `ledger/src/server.ts:346` ✅ | **fail closed.** No debit, no order state change — they commit together, so a ledger outage means `POST /pay` fails and nothing half-happens |
 | `micro-custody` | `POST /v1/sign` (`src/custodyclient.ts:148`), `POST /v1/addresses` (`src/custodyclient.ts:173`) | `custody/src/server.ts:424`, `:320` ✅ | **fail closed.** No signature, no bytes; the job retries under its lease. `/v1/sign` takes **seven** identity fields — address, chain, network, family, purpose, plus the payload — so a signature cannot be requested for a key the caller has misidentified (`src/custodyclient.ts:20`) |
-| `micro-indexer` | `GET /v1/chains/:chain/:network/transactions/:hash` (`src/indexerclient.ts:116`), `GET /v1/chains/:chain/:network/tokens/:address` (`src/indexerclient.ts:129`) | **❌ neither route exists** — see Known gaps | designed to fail **open**: a 404 is treated as an answer ("not yet indexed"), never a fault, because collapsing it into unavailability would make a fresh broadcast look like an outage (`src/indexerclient.ts:119-122`) |
+| `micro-indexer` | `GET /v1/transactions/:chain/:network/:hash` (`src/indexerclient.ts:196`), `GET /v1/tokens/:chain/:network/:address` (`src/indexerclient.ts:212`) | `indexer/src/server.ts:157`, `:159` ✅ | **fail open, but only for the 404 that is an answer.** `transaction_not_found` and `token_not_found` are the indexer's statements about a chain and become `null`; **any other 404 throws `IndexerRouteError`** (`src/indexerclient.ts:205`, `:223`), because a path this service asked for and the indexer does not serve says nothing about anybody's chain |
 
 The rule in `deploy.ts` is: **the indexer when it has the transaction, the node when it does not, and
 neither is allowed to be silently absent** (`src/indexerclient.ts:12-13`). The indexer being a
@@ -209,9 +209,25 @@ neither is allowed to be silently absent** (`src/indexerclient.ts:12-13`). The i
 heard of this hash" is emphatically not "the chain does not have it". Reading that absence as a
 failure would mark every fresh broadcast lost and re-deploy it (`src/indexerclient.ts:8-12`).
 
+**Both paths were wrong until this change, and neither failure had a symptom.** `transaction()`
+asked for `/v1/chains/:chain/:network/transactions/:hash` — the *status* route's shape with a
+resource bolted on — and `token()` for `/v1/chains/:chain/:network/tokens/:address`, which nothing
+served in any spelling. Every call 404'd, every 404 became `null`, and `token()` therefore rendered
+every project page's supply and authorities as "not yet indexed", permanently. All 113 tests passed
+throughout, because every one of them stubs the client rather than asking whether the request could
+reach a route.
+
+Two things stop the next one. At runtime the 404 splits, above. Before that, in CI, the
+`indexer-routes` job checks `micro-indexer` out and runs `scripts/checkindexerroutes.mjs`, which
+parses the route table out of `indexer/src/server.ts:153-163` and fails if any path this client
+requests is not one of them (`.github/workflows/ci.yml`). It compares **whole path shapes, not
+prefixes**: the dead path began `/v1/chains/`, which is a prefix the indexer really does serve, so a
+prefix check would have passed it. The job then mutates both sides and requires the check to go red,
+because a job that grades a file it failed to fetch looks exactly like a job that passed.
+
 `confirmations: null` from the indexer is **not zero** — it means the indexer knows the transaction
 but cannot currently say how deep it is, which happens while a tip is being re-read after a reorg. A
-caller that read null as zero would treat a confirmed deploy as fresh (`src/indexerclient.ts:51-53`).
+caller that read null as zero would treat a confirmed deploy as fresh (`src/indexerclient.ts:126-128`).
 
 ---
 
@@ -236,41 +252,33 @@ docker run -d --rm --name mint-pg \
 MINT_TEST_DATABASE_URL=postgres://mint:mint@127.0.0.1:55435/mint_test pnpm test
 ```
 
-**109 `test(` declarations**, `node:test` only. The upstreams are faked at the client interface —
+**121 `test(` declarations**, `node:test` only. The upstreams are faked at the client interface —
 there is no live chain in the suite — so what the tests prove is the state machine, the constraints
 and the crash-resumption points, not that the estate's other services answer as this service expects.
-The route-existence gap below is exactly what that boundary cannot catch.
+That boundary is exactly what let both indexer paths be wrong for the whole life of this service,
+and it is why `src/indexerclient.test.ts` asserts the path **on the wire** and `indexer-routes` in CI
+asserts it against the indexer's own source.
 
-CI is the estate's reusable `service-ci.yml`.
+CI is bespoke (`.github/workflows/ci.yml`) and has four jobs: the suite against a real Postgres,
+the committed-bytecode reproduction, the estate rules, and `indexer-routes` — which needs a
+`micro-indexer` checkout and therefore cannot be a test.
 
 ---
 
 ## Known gaps
 
-* **The indexer client calls two routes that do not exist.** `micro-indexer` serves
-  `/v1/transactions/:chain/:network/:hash` (`indexer/src/server.ts:320`); this client asks for
-  `/v1/chains/:chain/:network/transactions/:hash` (`src/indexerclient.ts:116`). And `micro-indexer`
-  has **no token-observation route at all** — its full domain surface is `chains/…/status`,
-  `addresses/…/activity`, `addresses/…/token-balances`, `transactions/…`,
-  `transactions/…/confirmations`, `blocks/…`, `watch/…`, `backfills/…`
-  (`indexer/src/server.ts:317-324`) — while this client asks for
-  `/v1/chains/:chain/:network/tokens/:address` (`src/indexerclient.ts:129`).
-
-  **Both failures are silent.** The indexer answers 404 for an unmatched path
-  (`indexer/src/server.ts:189-190`) and this client maps 404 to `null` as a legitimate answer
-  (`src/indexerclient.ts:122`, `:131`). The consequences:
-
-  * `transaction()` always returns `null`, so every deploy falls through to the node path. That path
-    is the designed fallback, so deploys still complete — the indexer is simply never consulted.
-  * `token()` always returns `null`, so **every project page renders supply, authorities and
-    contract address as "not yet indexed", permanently** — which is the honest rendering of a null
-    (`src/indexerclient.ts:27-28`) and therefore looks exactly like a chain that has not caught up.
-
-  This is the estate's recorded defect class: "seven clients built against a surface somebody
-  imagined; one made every on-chain escrow activation fail with a false diagnosis"
-  (`docs/ecosystem/18-build-status.md` §3.3i). **Reported, not fixed** — the remit of this change is
-  this README, and the repair is a decision about which service moves: `micro-indexer` gaining a
-  token-observation route, or this client being rewritten against the surface that exists.
+* **A token observation costs the indexer up to nine RPC calls, and nothing here caches it.**
+  `GET /v1/tokens/…` makes the indexer read the contract's state at its canonical head — a block
+  identity check, `eth_getCode`, and one `eth_call` per field. A project page is rendered on every
+  request (`src/server.ts:572`), so a hot page is that traffic multiplied. Nothing has fallen over
+  and no measurement exists; recorded here rather than pre-optimised, and the fix if it bites is a
+  short-lived cache in the indexer, where the observation's block identity already lives.
+* **`families.ts` still degrades to the node when the indexer answers badly.** The catch is narrowed
+  to `IndexerUnavailableError` now rather than swallowing every throwable (`src/families.ts:265-270`),
+  but `IndexerRouteError` is a subclass, so a wrong route on the deploy path still degrades silently
+  to `eth_getTransactionReceipt` instead of failing. That is deliberate — refusing a customer's
+  deploy over an integration bug is worse than deploying from the node's own receipt — and it is why
+  the CI check above, not the runtime split, is the real guard for this half.
 * **No route-level idempotency** — no helper, no table, no header. A retried `POST /v1/tokens`
   creates a second draft order. Recorded and deliberately unfixed at
   `docs/ecosystem/18-build-status.md` §3.3d.

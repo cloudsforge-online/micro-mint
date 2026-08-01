@@ -99,6 +99,82 @@ jobs:
           MINT_TEST_DATABASE_URL: postgres://mint:mint@127.0.0.1:5432/mint_test
         run: pnpm test
 
+  indexer-routes:
+    name: The indexer serves every path this service asks it for
+    runs-on: ubuntu-latest
+    # This job exists because both methods of `src/indexerclient.ts` requested paths micro-indexer
+    # has never served, and nothing in 113 passing tests noticed: every one of them stubbed the
+    # client rather than asking whether the request could reach a route. `token()` therefore
+    # returned null on every call and every project page rendered its supply and authorities as
+    # "not yet indexed", permanently (18-build-status §3.3i).
+    #
+    # It is a JOB and not a test for the reason micro-sdk's `drift` and `gateway` jobs already
+    # state: an invariant that needs a private sibling checkout cannot be a test, because
+    # `pnpm test` must pass for somebody who has only this repository — so it would have to skip,
+    # and a skipped test is an unmeasured one.
+    steps:
+      - uses: actions/checkout@v4
+
+      # Source only, read as TEXT. Importing it would mean resolving another repository's
+      # @cloudsforge/* workspace, and rule 2 forbids reaching into a sibling checkout from source.
+      - name: Fetch the indexer's route table
+        uses: actions/checkout@v4
+        with:
+          repository: cloudsforge-online/micro-indexer
+          ref: main
+          path: .indexer
+          # micro-indexer is private and the job token is scoped to THIS repository, so it cannot
+          # see another one. Same failure, and same fix, as the two sibling checkouts above.
+          token: ${{ secrets.ESTATE_READ_TOKEN || github.token }}
+          sparse-checkout: |
+            src/server.ts
+
+      # No skip path: a checkout that silently produced nothing is exit 1 here, loudly, rather than
+      # being graded as agreeing.
+      - name: Every path this client requests is a route the indexer serves
+        run: node scripts/checkindexerroutes.mjs --indexer .indexer
+
+      - name: …and the check would notice if they disagreed
+        # The assertion that makes the step above mean something. It is not enough that the checker
+        # says "all good": it has to be shown, against the REAL committed files, that it can say
+        # otherwise. Two mutations, because there are two ways for the sides to drift apart.
+        #
+        # The route is COMMENTED OUT rather than deleted, deliberately. The text is then still in
+        # the file and only comment-stripping makes the difference — so this proves in one step
+        # that the checker reads the real table AND that it still tells a route from a sentence
+        # about one, which is the bug that has now made six guards in this estate pass wrongly.
+        run: |
+          set -euo pipefail
+
+          real=.indexer/src/server.ts
+          mutant="$RUNNER_TEMP/mutant-indexer"
+          mkdir -p "$mutant/src"
+          sed "s|^\(.*'/tokens/:chain/:network/:address'.*\)$|// \1|" "$real" > "$mutant/src/server.ts"
+          if diff -q "$real" "$mutant/src/server.ts" >/dev/null; then
+            echo "::error::the mutation changed nothing — the token route is not where this step thinks"
+            exit 1
+          fi
+          if node scripts/checkindexerroutes.mjs --indexer "$mutant"; then
+            echo "::error::the check passed a table whose token route is commented out — it is not reading the table"
+            exit 1
+          fi
+
+          # And the other direction: the client asks for the path it used to ask for, which is the
+          # exact defect. Note that it begins `/v1/chains/`, which IS a prefix the indexer serves —
+          # a prefix check would pass this, which is why the checker compares whole shapes.
+          client="$RUNNER_TEMP/mutant-client.ts"
+          sed 's|/v1/transactions/|/v1/chains/|' src/indexerclient.ts > "$client"
+          if diff -q src/indexerclient.ts "$client" >/dev/null; then
+            echo "::error::the mutation changed nothing — the transaction path is not where this step thinks"
+            exit 1
+          fi
+          if node scripts/checkindexerroutes.mjs --indexer .indexer --client "$client"; then
+            echo "::error::the check passed a client asking for a path the indexer does not serve"
+            exit 1
+          fi
+
+          echo 'ok: the check goes red from either side, so a pass is evidence'
+
   contracts:
     name: Committed bytecode reproduces from the source
     runs-on: ubuntu-latest

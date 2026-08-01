@@ -38,7 +38,7 @@ import {
   type JsonRpc,
 } from './evm.ts'
 import type { CustodyClient } from './custodyclient.ts'
-import type { IndexerClient } from './indexerclient.ts'
+import { IndexerUnavailableError, type IndexerClient } from './indexerclient.ts'
 
 /** Raised by a family that exists as an object but has no working implementation. */
 export class NotImplementedError extends Error {
@@ -254,7 +254,20 @@ const EVM_FAMILY: DeployFamily = {
   async outcome(ctx, plan, rpc, indexer, ageMs, stuckMs) {
     // The indexer first, where it has an answer: it applies the estate's own confirmation depths,
     // so two services cannot disagree about whether a deploy is deep enough to be final.
-    const indexed = await indexer.transaction(ctx.chain, ctx.network, plan.txHash).catch(() => null)
+    //
+    // The catch is narrowed to the indexer's OWN error type on purpose. Degrading to the node when
+    // the indexer cannot be reached is the design (see `indexerclient.ts`, and the node branch
+    // below); swallowing every throwable was not — it also swallowed a bug in the client, which is
+    // half of why `transaction()` spent its whole life asking for a path that does not exist and
+    // nothing anywhere noticed. `IndexerRouteError` extends `IndexerUnavailableError`, so a wrong
+    // route still degrades here rather than failing a customer's deploy; what makes it visible is
+    // `checkindexerroutes.mjs`, in CI, before it can ship.
+    const indexed = await indexer
+      .transaction(ctx.chain, ctx.network, plan.txHash)
+      .catch((err: unknown) => {
+        if (err instanceof IndexerUnavailableError) return null
+        throw err
+      })
     if (indexed && indexed.status === 'failed') {
       return { kind: 'reverted', reason: 'the indexer reports this creation reverted' }
     }

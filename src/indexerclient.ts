@@ -26,6 +26,40 @@
  *
  * `null` from `token` is therefore never filled in from the order record. It renders as "not yet
  * indexed", which is honest, rather than as the intent dressed up as an observation.
+ *
+ * ## The defect this file used to be, and the rule that replaced it
+ *
+ * Both methods asked for paths `micro-indexer` has never served:
+ *
+ *   `transaction`  asked `/v1/chains/:chain/:network/transactions/:hash`. The route exists, spelled
+ *                  the other way round — `/v1/transactions/:chain/:network/:hash`
+ *                  (`indexer/src/server.ts:157`).
+ *   `token`        asked `/v1/chains/:chain/:network/tokens/:address`, and the indexer had no token
+ *                  route in any spelling. It has one now: `/v1/tokens/:chain/:network/:address`
+ *                  (`indexer/src/server.ts:159`), which reads the contract's own state at the
+ *                  canonical head this service's follower has walked.
+ *
+ * Neither failure had a symptom, because **a 404 was read as an answer**. `token()` returned null on
+ * every call, so every ForgeMint project page rendered its supply and its authorities as "not yet
+ * indexed" — permanently, silently, and on a page whose whole purpose (04-domain-model §5.3) is to
+ * show the chain rather than the order.
+ *
+ * So a 404 now splits, exactly as `micro-market`'s client splits it:
+ *
+ *   `transaction_not_found` / `token_not_found`   the indexer's answer ABOUT A CHAIN. Null, which
+ *                                                 is a fact, and the caller's rule is unchanged.
+ *   any other 404                                 a path this service asked for and the indexer
+ *                                                 does not serve. That is a defect in THIS file,
+ *                                                 not a statement about anybody's chain, and it
+ *                                                 throws `IndexerRouteError`.
+ *
+ * A 404 whose body cannot be read is treated as the second: an unreadable failure must never be
+ * promoted into a confident "there is nothing there".
+ *
+ * The runtime split is the second line of defence. The first is `scripts/checkindexerroutes.mjs`,
+ * which reads the route table out of `micro-indexer`'s own source in CI and fails if a path
+ * requested below is not one the indexer serves — because a defect that only shows up in
+ * production is one that has already shipped.
  */
 
 import { HttpClient, HttpError } from '@cloudsforge/http'
@@ -38,6 +72,47 @@ export class IndexerUnavailableError extends Error {
   constructor(message: string) {
     super(message)
     this.name = 'IndexerUnavailableError'
+  }
+}
+
+/**
+ * The indexer does not serve the path this service asked for.
+ *
+ * A **subclass**, deliberately: every existing caller treats an `IndexerUnavailableError` as "we
+ * could not ask" and degrades correctly, and none of them has to learn a new type to keep being
+ * right. What the subclass adds is that the two causes are distinguishable at the point where the
+ * difference matters — an outage is somebody else's incident, and this is our own bug, in this
+ * file, and it will not fix itself by being retried.
+ */
+export class IndexerRouteError extends IndexerUnavailableError {
+  readonly path: string
+  constructor(path: string, code: string | null) {
+    super(
+      `the indexer does not serve ${path} (404 ${code ?? 'with no readable code'}); this client is asking for a route that does not exist`,
+    )
+    this.name = 'IndexerRouteError'
+    this.path = path
+  }
+}
+
+/**
+ * The `error.code` inside an indexer failure, or null when there is not one to read.
+ *
+ * **This is what separates an answer from a misconfiguration, and the status alone will not do
+ * it.** `token_not_found` is the indexer saying it asked the chain and there is nothing observable
+ * at that address. `not_found` is the indexer saying it does not serve the path we asked for, which
+ * tells us nothing about any chain. Same 404, opposite meanings.
+ */
+function codeOf(err: HttpError): string | null {
+  try {
+    const parsed: unknown = JSON.parse(err.body)
+    if (typeof parsed !== 'object' || parsed === null) return null
+    const error: unknown = (parsed as Record<string, unknown>)['error']
+    if (typeof error !== 'object' || error === null) return null
+    const code: unknown = (error as Record<string, unknown>)['code']
+    return typeof code === 'string' ? code : null
+  } catch {
+    return null
   }
 }
 
@@ -111,24 +186,42 @@ export function httpIndexerClient(options: IndexerClientOptions): IndexerClient 
 
   return {
     async transaction(chain, network, hash) {
+      // The indexer's own convention: the RESOURCE first, then `:chain/:network`, then the key.
+      // `/chains/...` is the status route's shape and only the status route's — asking for it here
+      // is what made this call a permanent 404 (`indexer/src/server.ts:157`).
+      //
+      // ONE template literal, not two concatenated. `checkindexerroutes.mjs` scans this file for the
+      // paths it requests, and a path split across a `+` reaches that scan as a fragment it cannot
+      // recognise — a route the checker fails to see, rather than a route that is fine.
+      const path = `/v1/transactions/${encodeURIComponent(chain)}/${encodeURIComponent(network)}/${encodeURIComponent(hash)}`
       try {
-        return await client.get<IndexedTransaction>(
-          `/v1/chains/${chain}/${network}/transactions/${hash}`,
-        )
+        return await client.get<IndexedTransaction>(path)
       } catch (err) {
-        // A 404 is an ANSWER, not a fault: the indexer has not seen this hash. Collapsing it into
-        // an unavailability would make a fresh broadcast look like an outage and would be retried
-        // at error level for the whole of a normal confirmation window.
-        if (err instanceof HttpError && err.status === 404) return null
+        // A 404 carrying the indexer's own "never seen this hash" code is an ANSWER, not a fault.
+        // Collapsing it into an unavailability would make a fresh broadcast look like an outage and
+        // would be retried at error level for the whole of a normal confirmation window.
+        if (err instanceof HttpError && err.status === 404) {
+          if (codeOf(err) === 'transaction_not_found') return null
+          throw new IndexerRouteError(path, codeOf(err))
+        }
         throw translate(err)
       }
     },
 
     async token(chain, network, address) {
+      const path = `/v1/tokens/${encodeURIComponent(chain)}/${encodeURIComponent(network)}/${encodeURIComponent(address)}`
       try {
-        return await client.get<IndexedToken>(`/v1/chains/${chain}/${network}/tokens/${address}`)
+        return await client.get<IndexedToken>(path)
       } catch (err) {
-        if (err instanceof HttpError && err.status === 404) return null
+        if (err instanceof HttpError && err.status === 404) {
+          // `token_not_found` means the indexer asked the chain and found no contract answering
+          // `totalSupply()` at the block it has walked — which is what a deployment above the
+          // indexer's head looks like, and is honestly "not yet indexed".
+          if (codeOf(err) === 'token_not_found') return null
+          // Anything else is this client asking for a route that does not exist. Returning null
+          // here is the defect: it renders as "not yet indexed" on every project page, for ever.
+          throw new IndexerRouteError(path, codeOf(err))
+        }
         throw translate(err)
       }
     },
