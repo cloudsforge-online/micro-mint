@@ -252,7 +252,7 @@ docker run -d --rm --name mint-pg \
 MINT_TEST_DATABASE_URL=postgres://mint:mint@127.0.0.1:55435/mint_test pnpm test
 ```
 
-**121 `test(` declarations**, `node:test` only. The upstreams are faked at the client interface —
+**117 `test(` declarations**, `node:test` only, which run as **121 cases**: two of the declarations are inside a loop over the three token variants (`src/unit.test.ts:228-229`, `:249`), so each produces three. The upstreams are faked at the client interface —
 there is no live chain in the suite — so what the tests prove is the state machine, the constraints
 and the crash-resumption points, not that the estate's other services answer as this service expects.
 That boundary is exactly what let both indexer paths be wrong for the whole life of this service,
