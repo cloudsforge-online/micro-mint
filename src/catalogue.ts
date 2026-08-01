@@ -68,6 +68,26 @@ export function variantSpec(variant: Variant): VariantSpec {
 }
 
 /**
+ * An order naming something no committed contract can build, and the FIELD that made it so.
+ *
+ * A subclass of `ChainError`, so nothing that already catches or classifies a `ChainError` changes
+ * behaviour. What it adds is `field`, and that is the whole point: `POST /v1/tokens` answers it as
+ * `unbuildable_order` rather than a generic `bad_request`, so a caller can put the message next to
+ * the input that caused it instead of next to the form. "Your order is invalid" and "`cap` is the
+ * word that made this impossible" are not the same answer.
+ */
+export class UnbuildableOrderError extends ChainError {
+  /** The request field a caller must change. Never a column name, never a contract name. */
+  readonly field: 'features' | 'cap'
+
+  constructor(field: 'features' | 'cap', message: string) {
+    super(message)
+    this.name = 'UnbuildableOrderError'
+    this.field = field
+  }
+}
+
+/**
  * The variant whose contract provides EXACTLY the requested features — never a superset.
  *
  * A superset would be worse than a refusal. `pausable` on a token nobody asked to be pausable is
@@ -84,7 +104,8 @@ export function variantFor(features: readonly Feature[]): VariantSpec {
   const offered = Object.values(VARIANTS)
     .map((spec) => `[${spec.features.join(', ') || 'none'}]`)
     .join(' ')
-  throw new ChainError(
+  throw new UnbuildableOrderError(
+    'features',
     `no committed contract provides exactly [${[...wanted].sort().join(', ')}] — available: ${offered}`,
   )
 }
@@ -115,12 +136,52 @@ export function constructorArgs(spec: VariantSpec, input: ConstructorInput): rea
     { type: 'uint256', value: input.supply },
   ]
   if (spec.cap === 'required') {
-    if (input.cap === null) throw new ChainError(`${spec.contract} requires a cap`)
-    if (input.cap < input.supply) throw new ChainError('cap must be at least the initial supply')
+    if (input.cap === null) {
+      throw new UnbuildableOrderError('cap', `${spec.contract} requires a cap`)
+    }
+    if (input.cap < input.supply) {
+      throw new UnbuildableOrderError('cap', 'cap must be at least the initial supply')
+    }
     head.push({ type: 'uint256', value: input.cap })
   } else if (input.cap !== null) {
-    throw new ChainError(`${spec.contract} takes no cap`)
+    throw new UnbuildableOrderError('cap', `${spec.contract} takes no cap`)
   }
   head.push({ type: 'address', value: input.ownerAddress })
   return Object.freeze(head)
+}
+
+/**
+ * Can this order be built at all? Asked at the ORDER, answered before anything is charged.
+ *
+ * ## Why it exists
+ *
+ * `POST /v1/tokens` used to call `variantFor` alone, and `variantFor` never reads the cap. The cap
+ * rule lived one call further on, inside `constructorArgs`, which runs in the deploy job
+ * (`families.ts:336-348`) — long after `POST /v1/tokens/:id/pay` has debited the customer. So an
+ * order for the foundry variant with no cap was accepted, charged, and then could not be built:
+ * `dataFor` threw a `ChainError`, `driveDeploy` matched none of its four classified failures
+ * (`deploy.ts:118-169`), released the lease and rethrew, and `outstandingDeploys` — which selects
+ * on `CLAIMABLE`, and `deploying` is in it (`tokens.ts:68-73`) — swept the row back onto the queue
+ * on the next tick. Not a terminal failure with a reason on the row: a permanent loop, with the
+ * customer's Shards spent and the order never reaching any state a human is shown.
+ *
+ * ## Why it is not a second copy of the rule
+ *
+ * It IS the rule. `variantFor` and `constructorArgs` are the two functions the deploy job itself
+ * calls, invoked here against the order exactly as submitted. Nothing is restated, so nothing can
+ * drift: a cap condition added to a variant tomorrow is enforced at the order route on the same
+ * commit, without anybody remembering that a second list exists. This estate has already shipped a
+ * client and a server that disagreed because a rule was written down twice.
+ *
+ * The deploy-time call is NOT removed by this and must not be: the order route sees one request,
+ * and the job is the last thing standing between a stored row and a signed contract creation.
+ */
+export function assertBuildable(
+  features: readonly Feature[],
+  input: ConstructorInput,
+): VariantSpec {
+  const spec = variantFor(features)
+  // The encoded arguments are discarded; the THROW is the product.
+  void constructorArgs(spec, input)
+  return spec
 }

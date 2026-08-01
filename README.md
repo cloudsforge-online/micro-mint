@@ -9,7 +9,7 @@ contract source is `micro-contracts`'.
 > **`POST /v1/tokens/:id/deploy` answers 202 and a status URL. It reaches no chain.** The whole
 > handler is authenticate, check the mainnet allowlist, one conditional UPDATE to confirm the order
 > can be deployed, one enqueue, and a `Location` header — it cannot take more than a few
-> milliseconds because there is nothing in it that can (`src/server.ts:7-22`, handler at `:491`).
+> milliseconds because there is nothing in it that can (`src/server.ts:7-22`, handler at `:515`).
 > **The frozen service held the request for up to 180 seconds**, awaiting a settlement pass, a
 > balance read, a nonce read, a fee read, a gas estimate, a fifteen-second signing call, a
 > broadcast, and then a receipt (`src/deploy.ts:8-11`).
@@ -55,35 +55,69 @@ after the send is covered because the hash was written **with** the bytes.
 Read out of `src/server.ts`. Every domain route is served under `/v1` **only** — there is no
 unprefixed spelling here, unlike `micro-indexer`.
 
-`authenticate()` resolves the bearer token and checks **nothing else** (`src/server.ts:647`). Scope
+`authenticate()` resolves the bearer token and checks **nothing else** (`src/server.ts:671`). Scope
 is checked per-route and **only for service principals**: `if (principal.kind === 'service')
 requireScope(principal, …)`. A user token is authorised by **ownership** instead — `ownedToken()`
-looks the row up by owner subject, or by id if the principal is an `admin` (`src/server.ts:604-620`).
+looks the row up by owner subject, or by id if the principal is an `admin` (`src/server.ts:628-638`).
 
 | Method | Path | Who | Idempotency-Key | What it does |
 | --- | --- | --- | --- | --- |
-| `GET` | `/livez` | **no auth** | — | liveness (`src/server.ts:314`) |
-| `GET` | `/readyz` | **no auth** | — | 200/503 (`src/server.ts:316`) |
-| `GET` | `/metrics` | **no auth** | — | Prometheus text (`src/server.ts:324`) |
-| `GET` | `/v1/catalogue` | **no auth** | — | price, network and the three variants. **Public deliberately**: a catalogue behind a token cannot be browsed (`src/server.ts:340`, reasoning at `:339`) |
-| `POST` | `/v1/tokens` | user, or service with `mint:write` | **none — see below** | opens an order. **Nothing is charged and nothing is deployed** (`src/server.ts:359`, scope at `:361`) |
-| `GET` | `/v1/tokens` | user, or service with `mint:read` | — | the caller's orders. An `admin` may name another subject (`src/server.ts:417`, `:421`) |
-| `GET` | `/v1/tokens/:id` | owner or admin | — | the order, plus **every deploy attempt**, so "what happened" is answered from the row rather than a log search (`src/server.ts:430`, `:440-448`) |
-| `POST` | `/v1/tokens/:id/pay` | owner, or service with `mint:write` | **none** | debits Shards and moves the order to `paid`. **One transaction: the ledger entry and the state change together.** 201 fresh, **200 on a replay**, so a client can tell whether its retry did the work (`src/server.ts:454`, status at `:472`) |
-| `POST` | `/v1/tokens/:id/deploy` | owner, or service with `mint:write` | **none** | **202 + `Location`.** Enqueues `token.deploy`. The mainnet allowlist is checked **here, before anything is queued**, so a refusal costs a request rather than a job that dead-letters somewhere an operator has to go and read (`src/server.ts:491`, allowlist at `:518-527`) |
-| `PUT` | `/v1/tokens/:id/page` | owner, or service with `mint:write` | — | upserts the editorial half of the project page (`src/server.ts:546`) |
-| `GET` | `/v1/tokens/:id/page` | **no auth** | — | renders the page: editorial fields from this database, **on-chain facts from the indexer** (`src/server.ts:572`) |
+| `GET` | `/livez` | **no auth** | — | liveness (`src/server.ts:328`) |
+| `GET` | `/readyz` | **no auth** | — | 200/503 (`src/server.ts:330`) |
+| `GET` | `/metrics` | **no auth** | — | Prometheus text (`src/server.ts:338`) |
+| `GET` | `/v1/catalogue` | **no auth** | — | price, network and the three variants. **Public deliberately**: a catalogue behind a token cannot be browsed (`src/server.ts:354`, reasoning at `:353`) |
+| `POST` | `/v1/tokens` | user, or service with `mint:write` | **none — see below** | opens an order. **Nothing is charged and nothing is deployed**, and **an order that could not be built is refused here** (`src/server.ts:373`, scope at `:375`, gate at `:412`) |
+| `GET` | `/v1/tokens` | user, or service with `mint:read` | — | the caller's orders. An `admin` may name another subject (`src/server.ts:441`, `:445`) |
+| `GET` | `/v1/tokens/:id` | owner or admin | — | the order, plus **every deploy attempt**, so "what happened" is answered from the row rather than a log search (`src/server.ts:454`, `:465-472`) |
+| `POST` | `/v1/tokens/:id/pay` | owner, or service with `mint:write` | **none** | debits Shards and moves the order to `paid`. **One transaction: the ledger entry and the state change together.** 201 fresh, **200 on a replay**, so a client can tell whether its retry did the work (`src/server.ts:478`, status at `:501`) |
+| `POST` | `/v1/tokens/:id/deploy` | owner, or service with `mint:write` | **none** | **202 + `Location`.** Enqueues `token.deploy`. The mainnet allowlist is checked **here, before anything is queued**, so a refusal costs a request rather than a job that dead-letters somewhere an operator has to go and read (`src/server.ts:515`, allowlist at `:533-542`) |
+| `PUT` | `/v1/tokens/:id/page` | owner, or service with `mint:write` | — | upserts the editorial half of the project page (`src/server.ts:570`) |
+| `GET` | `/v1/tokens/:id/page` | **no auth** | — | renders the page: editorial fields from this database, **on-chain facts from the indexer** (`src/server.ts:596`) |
 
 **Four routes make no `authenticate()` call**: `/livez`, `/readyz`, `/metrics` and
 `/v1/catalogue` — plus `GET /v1/tokens/:id/page`, which is a public page by design
-(`src/server.ts:572`).
+(`src/server.ts:596`).
 
 "Does not exist" and "is not yours" are **the same 404** on purpose: a distinct 403 for the second
 is an oracle that lets an unauthorised caller enumerate which order ids exist
-(`src/server.ts:602-608`).
+(`src/server.ts:625-626`).
 
 Amounts cross the wire as **strings** — a supply of 10²⁴ is an ordinary token and does not survive a
-JSON number (`src/server.ts:628`).
+JSON number (`src/server.ts:713`).
+
+### An order that cannot be built is refused before it can be paid for
+
+`POST /v1/tokens` calls `assertBuildable` (`src/catalogue.ts:179`, called at `src/server.ts:412`).
+It answers **400 `unbuildable_order`** with a `field` — `cap` or `features` — in the error body
+(`src/server.ts:299`), which is deliberately **not** the generic `bad_request` every other 400 uses:
+a caller reading `unbuildable_order` knows the order can never succeed as written and knows which
+input to change.
+
+**It was `variantFor(features)` alone, and `variantFor` never reads the cap.** The cap rule ran for
+the first time in `constructorArgs` (`src/catalogue.ts:138-148`), which runs inside the deploy job
+(`src/families.ts:336-348`) — after `POST /v1/tokens/:id/pay` has debited the customer. So a foundry
+order with no cap, or with a cap below its own initial supply, was **accepted, charged, and then
+unbuildable**. It did not even fail cleanly: the error matches none of `driveDeploy`'s four
+classified failures (`src/deploy.ts:118-169`), so the lease was released and the row stayed
+`deploying` — which is in `CLAIMABLE` (`src/tokens.ts:68-73`), so the sweep put it straight back on
+the queue on the next tick, for ever, with the money gone and no state a customer is ever shown.
+
+**Two of the three cap failures were reachable, and it is worth being exact about which.** The
+database already refuses a cap below the supply — `constraint tokens_cap_covers_supply check (cap is
+null or cap >= supply)` (`src/migrations.ts:176`) — so that case was a **500 at the order**, ugly but
+not a charge. The two that got through the insert were the ones the constraint cannot see: a capped
+variant with **no** cap (`cap is null` satisfies the check) and an uncapped variant with a cap
+(`cap >= supply` satisfies it). Both were accepted 201 and payable. Measured by mutating the gate
+back to `variantFor(features)` and running `src/server.test.ts`: 201, 500 and 201 respectively where
+the three tests now expect 400.
+
+**`assertBuildable` is not a second copy of the rule — it is the rule.** It calls the deploy path's
+own `variantFor` and `constructorArgs` against the order as submitted and discards the encoded
+arguments; the throw is the product. A cap condition added to a variant tomorrow is enforced at the
+order route on the same commit, with no second list to remember. `src/unit.test.ts` asserts the two
+gates agree on all forty feature/cap combinations, so replacing that call with a hand-written check
+goes red on whichever case it got wrong. **The deploy-time call stays**: the order route sees one
+request, and the job is the last thing between a stored row and a signed contract creation.
 
 ### There is no idempotency infrastructure at all
 
@@ -99,10 +133,10 @@ The two routes where a duplicate would cost money are protected by other means, 
 being precise about which:
 
 * `POST /pay` is a conditional state transition — an order already `paid` cannot be paid again, and
-  the ledger entry and the state change commit together (`src/server.ts:454`). The replay answers
+  the ledger entry and the state change commit together (`src/server.ts:478`). The replay answers
   200 rather than double-debiting.
 * `POST /deploy` enqueues with `onConflict: 'keep'`, so **three clicks before the first job runs
-  produce one run** (`src/server.ts:536-541`), and `claimDeploy`'s row-level lease makes two deploys
+  produce one run** (`src/server.ts:547-552`), and `claimDeploy`'s row-level lease makes two deploys
   of one token impossible (`src/jobs.ts:20-22`).
 
 ---
@@ -186,7 +220,7 @@ and `MINT_SERVICE_TOKEN` ship **empty**, so a copied file refuses to boot until 
 | `MINT_RPC_DEADLINE_MS` | `5000` | 100–60000 (`src/env.ts:271`) |
 | `MINT_NETWORK` | `testnet` | **the one network this deployment mints on.** A single value rather than a free per-request parameter, because a service that can be asked for either is **one bad request away from putting a customer's contract on a mainnet they did not pay for** (`src/env.ts:272`, reasoning at `:186-193`) |
 | `MINT_DEPLOYS_ENABLED` | `true` | set `false` to stop deploying **without stopping the service**, so orders still take payment (`src/env.ts:274`, `:196`) |
-| `MINT_MAINNET_ALLOWLIST` | `` (nobody) | subjects permitted to deploy to a mainnet. **Empty means nobody, and that is the fail-closed default the frozen service does not have** — it gates mainnet on nothing at all (`src/env.ts:275`, reasoning at `:198-201` and `src/server.ts:90`) |
+| `MINT_MAINNET_ALLOWLIST` | `` (nobody) | subjects permitted to deploy to a mainnet. **Empty means nobody, and that is the fail-closed default the frozen service does not have** — it gates mainnet on nothing at all (`src/env.ts:275`, reasoning at `:198-201` and `src/server.ts:94-99`) |
 | `MINT_MIN_GAS_PRICE_WEI` | `1000000000` | parsed as **wei with `BigInt`, never `Number`**: one EMBER is 1e18 wei, four orders of magnitude past what a double holds exactly, and a rounded bound is a bound that does not hold at the value it was written for (`src/env.ts:237`, reasoning at `:100-104`) |
 | `MINT_MAX_GAS_PRICE_WEI` | `500000000000` | must be ≥ the minimum, or boot fails (`src/env.ts:238-241`) |
 | `MINT_MAX_FEE_WEI` | `1e18` | the most one deploy may cost in gas. Custody enforces its own ceiling at 2e18 (`src/env.ts:279`, `:206`) |
@@ -252,7 +286,9 @@ docker run -d --rm --name mint-pg \
 MINT_TEST_DATABASE_URL=postgres://mint:mint@127.0.0.1:55435/mint_test pnpm test
 ```
 
-**117 `test(` declarations**, `node:test` only, which run as **121 cases**: two of the declarations are inside a loop over the three token variants (`src/unit.test.ts:228-229`, `:249`), so each produces three. The upstreams are faked at the client interface —
+**125 `test(` declarations**, `node:test` only, which run as **129 cases**: two of the declarations
+are inside a loop over the three token variants (`src/unit.test.ts:334`, `:354`), so each produces
+three. The upstreams are faked at the client interface —
 there is no live chain in the suite — so what the tests prove is the state machine, the constraints
 and the crash-resumption points, not that the estate's other services answer as this service expects.
 That boundary is exactly what let both indexer paths be wrong for the whole life of this service,
@@ -270,7 +306,7 @@ the committed-bytecode reproduction, the estate rules, and `indexer-routes` — 
 * **A token observation costs the indexer up to nine RPC calls, and nothing here caches it.**
   `GET /v1/tokens/…` makes the indexer read the contract's state at its canonical head — a block
   identity check, `eth_getCode`, and one `eth_call` per field. A project page is rendered on every
-  request (`src/server.ts:572`), so a hot page is that traffic multiplied. Nothing has fallen over
+  request (`src/server.ts:596`), so a hot page is that traffic multiplied. Nothing has fallen over
   and no measurement exists; recorded here rather than pre-optimised, and the fix if it bites is a
   short-lived cache in the indexer, where the observation's block identity already lives.
 * **`families.ts` still degrades to the node when the indexer answers badly.** The catch is narrowed
@@ -282,8 +318,44 @@ the committed-bytecode reproduction, the estate rules, and `indexer-routes` — 
 * **No route-level idempotency** — no helper, no table, no header. A retried `POST /v1/tokens`
   creates a second draft order. Recorded and deliberately unfixed at
   `docs/ecosystem/18-build-status.md` §3.3d.
-* **`/metrics` is unauthenticated** (`src/server.ts:324`).
-* **A failed deploy is not retried automatically** (`src/server.ts:501`). The order is terminal and
+* **`/metrics` is unauthenticated** (`src/server.ts:338`).
+* **A failed deploy is not retried automatically** (`src/server.ts:523-525`). The order is terminal and
   needs an operator; `token_deploy_attempts` holds every attempt so the decision can be made from
   the row.
 * **No OpenAPI description**, estate-wide (`docs/ecosystem/18-build-status.md` §3.3d, item 1).
+* **An unclassified throw on the deploy path is a loop, not a failure.** `driveDeploy` classifies
+  four error types and everything else falls through to `releaseLease` + rethrow
+  (`src/deploy.ts:118-169`), leaving the row in `deploying` — which is in `CLAIMABLE`
+  (`src/tokens.ts:68-73`), so `token.sweep` re-enqueues it on the next tick, indefinitely, with
+  `deploy_attempts` climbing and no cap on it (`src/tokens.ts:386`). This is how the unbuildable-cap
+  defect above actually manifested, and closing that defect at the order route does **not** close
+  this: it removes the only known way to reach it, not the mechanism. Left as it is deliberately —
+  the alternative is failing a row terminally on an error nobody has classified, which is exactly
+  what `CLAIMABLE`'s exclusion of `failed` exists to prevent (`src/tokens.ts:60-73`). What is
+  missing is an alarm: `mint_deploys_outstanding` is sampled by the sweep
+  (`src/jobs.ts:200`) and a row stuck in it forever is visible there, unaliased.
+* **No already-stored order can be in the unbuildable state, and this was checked rather than
+  assumed.** `micro-mint` has never run against a persistent database: the only environment that
+  exists is `deploy/compose/docker-compose.slice.yml`, which brings up identity and ledger and
+  nothing else, and `docs/ecosystem/18-build-status.md:47-52` states that no environment exists
+  beyond it. So there is no store to migrate and none has been touched. For the day there is one,
+  the read-only query that finds them is:
+
+  ```sql
+  -- Orders whose (features, cap) pair no committed contract can build. READ ONLY.
+  with o as (
+    select id, status, supply, cap, created_at,
+           coalesce((select array_agg(f order by f) from unnest(features) f), '{}') as fs
+      from tokens
+  )
+  select id, status, fs, supply, cap, created_at from o
+   where not (
+        (fs = '{}'::text[]                                 and cap is null)
+     or (fs = array['burnable','mintable']                  and cap is null)
+     or (fs = array['burnable','mintable','pausable']       and cap is not null and cap >= supply)
+   )
+   order by created_at;
+  ```
+
+  Any row it returns whose `status` is past `awaiting_payment` is a customer who has paid for a
+  token that cannot be built. That is a refund decision and an operator's, not a migration.

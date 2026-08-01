@@ -112,6 +112,11 @@ beforeEach(async () => {
   if (!enabled) return
   await resetMint(sql)
   enqueued.length = 0
+  // The ledger fake outlives the suite, so without this a case asserting "one debit" is really
+  // asserting "one debit in every case that ran before it too" — it passed only while exactly one
+  // case ever paid. `ledger.entries.length` is the money assertion in this file; it has to mean
+  // what it says.
+  ledger.reset()
 })
 
 after(async () => {
@@ -214,6 +219,88 @@ test('a feature set no committed contract provides is refused BEFORE payment', {
   })
   assert.equal(res.status, 400)
   assert.match(JSON.stringify(res.body), /no committed contract/)
+  const error = res.body['error'] as Record<string, unknown>
+  assert.equal(error['code'], 'unbuildable_order')
+  assert.equal(error['field'], 'features')
+})
+
+/**
+ * ══════════════════════════════════════════════════════════════════════════════════════════════
+ * AN ORDER THAT CANNOT BE BUILT NEVER REACHES A PAYABLE STATE.
+ *
+ * The defect: `POST /v1/tokens` called `variantFor` alone, and `variantFor` never reads the cap.
+ * The cap rule ran for the first time in `constructorArgs`, inside the deploy job — so a foundry
+ * order with no cap was accepted, then charged by `POST /v1/tokens/:id/pay`, and only then found
+ * to be unbuildable. It did not even fail cleanly: the `ChainError` from `dataFor` matches none of
+ * `driveDeploy`'s four classified failures (`deploy.ts:118-169`), so the lease was released, the
+ * row stayed `deploying`, `deploying` is in `CLAIMABLE` (`tokens.ts:68-73`), and the sweep put it
+ * straight back on the queue. A permanent loop with the customer's Shards already spent.
+ *
+ * This asserts the money consequence directly: after the refusal there is no order to pay for, and
+ * the ledger has not been touched.
+ * ══════════════════════════════════════════════════════════════════════════════════════════════
+ */
+test('a capped variant ordered with no cap cannot reach a payable state', { skip }, async () => {
+  const foundry = { ...ORDER, features: ['mintable', 'burnable', 'pausable'], cap: null }
+  const res = await call('/v1/tokens', { method: 'POST', token: 'alice', body: foundry })
+
+  assert.equal(res.status, 400)
+  const error = res.body['error'] as Record<string, unknown>
+  assert.equal(error['code'], 'unbuildable_order', 'distinguishable from a generic 400')
+  assert.equal(error['field'], 'cap', 'the caller is told WHICH field to change')
+  assert.match(String(error['message']), /requires a cap/)
+
+  // No row, so no id, so nothing for `POST /v1/tokens/:id/pay` to charge against. This is the
+  // whole claim: the money path is unreachable because the order does not exist.
+  assert.equal(res.body['token'], undefined)
+  assert.deepEqual((await call('/v1/tokens', { token: 'alice' })).body['tokens'], [])
+  assert.equal(ledger.entries.length, 0)
+})
+
+test('a cap below the initial supply is refused at the order, not at the deploy', { skip }, async () => {
+  // The other half of the same rule, and the one a caller is likeliest to hit: a cap that exists
+  // but is smaller than the supply the contract mints in its constructor.
+  const res = await call('/v1/tokens', {
+    method: 'POST',
+    token: 'alice',
+    body: { ...ORDER, features: ['mintable', 'burnable', 'pausable'], cap: '1000' },
+  })
+  assert.equal(res.status, 400)
+  assert.equal((res.body['error'] as Record<string, unknown>)['field'], 'cap')
+  assert.equal(ledger.entries.length, 0)
+})
+
+test('a cap on a variant whose contract takes none is refused too', { skip }, async () => {
+  // Uncapped BY DESIGN is a fact the project page reports. Accepting a nominal ceiling here and
+  // discarding it at the deploy would make that page lie about the token it describes.
+  const res = await call('/v1/tokens', {
+    method: 'POST',
+    token: 'alice',
+    body: { ...ORDER, features: ['mintable', 'burnable'], cap: '2000000000000000000000000' },
+  })
+  assert.equal(res.status, 400)
+  assert.equal((res.body['error'] as Record<string, unknown>)['field'], 'cap')
+  assert.match(String((res.body['error'] as Record<string, unknown>)['message']), /takes no cap/)
+  assert.equal(ledger.entries.length, 0)
+})
+
+test('a foundry order with a cap at or above its supply is accepted, and is payable', { skip }, async () => {
+  // The gate refuses what cannot be built and nothing else. Without this the three tests above
+  // would pass against a route that refused every capped order.
+  const created = await call('/v1/tokens', {
+    method: 'POST',
+    token: 'alice',
+    body: {
+      ...ORDER,
+      features: ['mintable', 'burnable', 'pausable'],
+      cap: '2000000000000000000000000',
+    },
+  })
+  assert.equal(created.status, 201)
+  const id = (created.body['token'] as Record<string, unknown>)['id'] as string
+  const paid = await call(`/v1/tokens/${id}/pay`, { method: 'POST', token: 'alice' })
+  assert.equal(paid.status, 201)
+  assert.equal(ledger.entries.length, 1)
 })
 
 test('a supply sent as a JSON number is refused rather than rounded', { skip }, async () => {

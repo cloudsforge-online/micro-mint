@@ -50,7 +50,13 @@ import { Metrics, newRequestId, type Logger } from '@cloudsforge/telemetry'
 import type { JobQueue } from '@cloudsforge/jobs'
 import { chainKey, isChainId, isNetwork, type ChainId } from './chains.ts'
 import { canonicaliseEvm } from './evm.ts'
-import { isFeature, variantFor, type Feature } from './catalogue.ts'
+import {
+  UnbuildableOrderError,
+  assertBuildable,
+  isFeature,
+  variantFor,
+  type Feature,
+} from './catalogue.ts'
 import { InsufficientBalanceError, OrderStateError, payForDeploy, type PayDeps } from './orders.ts'
 import { renderProjectPage, upsertProjectPage, type RenderDeps } from './projectpages.ts'
 import { DEPLOY_KIND } from './jobs.ts'
@@ -284,6 +290,14 @@ async function handle(route: Route | undefined, ctx: RequestContext, deps: Serve
       }
       return errorReply(409, 'order_state', err.message, ctx.requestId)
     }
+    // Ahead of both branches below, because it is a subclass of `ChainError` and because the whole
+    // reason it exists is to be DISTINGUISHABLE from a generic 400. A caller reading
+    // `unbuildable_order` knows the order can never succeed as written and which field to change;
+    // a caller reading `bad_request` knows only that something was wrong somewhere.
+    if (err instanceof UnbuildableOrderError) {
+      deps.metrics.increment('mint_orders_total', { outcome: 'unbuildable' })
+      return errorReply(400, 'unbuildable_order', err.message, ctx.requestId, { field: err.field })
+    }
     if (err instanceof BadRequestError || err instanceof RangeError) {
       return errorReply(400, 'bad_request', err.message, ctx.requestId)
     }
@@ -377,15 +391,25 @@ function buildRoutes(): Route[] {
       const supply = requireQuantity(body, 'supply')
       const cap = body['cap'] == null ? null : requireQuantity(body, 'cap')
       const features = readFeatures(body['features'])
-      // Refuse here rather than at deploy time. A request for a feature set no committed contract
-      // provides is a request that can never succeed, and discovering that after payment is the
-      // worst possible moment.
-      variantFor(features)
 
       // EIP-55 checksummed, and the zero address refused. This is the field that decides who owns
       // the contract for ever; a mistyped character here is a token nobody holds the key to.
       const ownerAddress = canonicaliseEvm(requireString(body, 'ownerAddress'))
       const ownerWalletId = requireString(body, 'ownerWalletId')
+
+      // ══════════════════════════════════════════════════════════════════════════════════════════
+      // **AN ORDER THAT CANNOT BE BUILT IS REFUSED BEFORE IT CAN BE PAID FOR.**
+      //
+      // This used to be `variantFor(features)` alone, which never reads the cap. The cap rule ran
+      // for the first time inside the deploy job, after `POST /v1/tokens/:id/pay` had already
+      // debited the customer — so a capped variant ordered with no cap was accepted, charged, and
+      // then swept round the deploy queue for ever with the money gone.
+      //
+      // `assertBuildable` calls the deploy path's OWN `variantFor` and `constructorArgs` against
+      // this request. It is the rule, not a copy of it; see the note on it in `catalogue.ts`. The
+      // deploy-time call stays where it is — this is the first gate, not the last one.
+      // ══════════════════════════════════════════════════════════════════════════════════════════
+      assertBuildable(features, { name, symbol, decimals, supply, cap, ownerAddress })
 
       const done = deps.lifecycle.track()
       try {
@@ -737,8 +761,18 @@ async function readJson(req: IncomingMessage): Promise<Record<string, unknown>> 
  * The id in the body rather than only in the header is what makes a support conversation work: a
  * user can read back what their browser showed them, and it joins to the log line and the trace.
  */
-function errorReply(status: number, code: string, message: string, requestId: string): Reply {
-  return { status, body: { error: { code, message, requestId } } }
+/**
+ * `extra` is merged into the error object, never alongside it, so a caller reading `error.field`
+ * finds it in the same place it finds `error.code`.
+ */
+function errorReply(
+  status: number,
+  code: string,
+  message: string,
+  requestId: string,
+  extra?: Record<string, unknown>,
+): Reply {
+  return { status, body: { error: { code, message, requestId, ...extra } } }
 }
 
 function send(res: ServerResponse, reply: Reply, requestId: string): void {

@@ -21,7 +21,15 @@ import {
   toChecksumAddress,
 } from './evm.ts'
 import { CHAIN_IDS, custodyChainOf, evmChainId, familyOf, legacyOnly } from './chains.ts'
-import { constructorArgs, variantFor, variantSpec } from './catalogue.ts'
+import {
+  UnbuildableOrderError,
+  assertBuildable,
+  constructorArgs,
+  variantFor,
+  variantSpec,
+  type ConstructorInput,
+  type Feature,
+} from './catalogue.ts'
 import {
   FIXEDSUPPLYTOKEN_ABI,
   FOUNDRYTOKEN_ABI,
@@ -203,6 +211,103 @@ test('the fixed-supply contract takes no cap and the foundry contract requires o
     /at least the initial supply/,
   )
 })
+
+/* ---------------------------------------------------- the order-time gate, and the money it saves */
+
+/**
+ * `assertBuildable` is the gate `POST /v1/tokens` puts in front of payment.
+ *
+ * The defect it closes: the route called `variantFor` alone, `variantFor` never reads the cap, and
+ * the cap rule ran for the first time inside the deploy job — after the customer had been charged.
+ * These tests are about the FIELD as much as the refusal, because a 400 that does not say `cap` is
+ * a 400 the customer cannot act on.
+ */
+const ORDER: Omit<ConstructorInput, 'cap'> = {
+  name: 'Ashfall',
+  symbol: 'ASH',
+  decimals: 18,
+  supply: 1_000n,
+  ownerAddress: '0x5aAeb6053F3E94C9b9A09f33669435E7Ef1BeAed',
+}
+
+const FOUNDRY: readonly Feature[] = ['mintable', 'burnable', 'pausable']
+
+test('a capped variant ordered with no cap is refused at the ORDER, and the refusal names the field', () => {
+  assert.throws(
+    () => assertBuildable(FOUNDRY, { ...ORDER, cap: null }),
+    (err: unknown) =>
+      err instanceof UnbuildableOrderError && err.field === 'cap' && /requires a cap/.test(err.message),
+  )
+})
+
+test('a cap below the supply, and a cap on a variant that takes none, are the same refusal', () => {
+  assert.throws(
+    () => assertBuildable(FOUNDRY, { ...ORDER, cap: 999n }),
+    (err: unknown) => err instanceof UnbuildableOrderError && err.field === 'cap',
+  )
+  assert.throws(
+    () => assertBuildable([], { ...ORDER, cap: 10n }),
+    (err: unknown) => err instanceof UnbuildableOrderError && err.field === 'cap',
+  )
+  assert.throws(
+    () => assertBuildable(['mintable', 'burnable'], { ...ORDER, cap: 10n }),
+    (err: unknown) => err instanceof UnbuildableOrderError && err.field === 'cap',
+  )
+})
+
+test('an impossible feature set is `features`, not `cap` — the two are told apart', () => {
+  assert.throws(
+    () => assertBuildable(['pausable'], { ...ORDER, cap: null }),
+    (err: unknown) => err instanceof UnbuildableOrderError && err.field === 'features',
+  )
+})
+
+test('every order the deploy could build is one the order route accepts, and no other', () => {
+  // ══════════════════════════════════════════════════════════════════════════════════════════════
+  // THE ONE THAT MATTERS: the order gate and the deploy gate agree on EVERY combination.
+  //
+  // It is asserted rather than assumed even though `assertBuildable` calls `constructorArgs`
+  // directly, because the day somebody replaces that call with a hand-written cap check — which is
+  // exactly how this estate got a client and a server that disagreed — this goes red on the case
+  // they got wrong, at the point of order, with the customer's money still in their account.
+  // ══════════════════════════════════════════════════════════════════════════════════════════════
+  const featureSets: readonly (readonly Feature[])[] = [
+    [],
+    ['mintable'],
+    ['burnable'],
+    ['pausable'],
+    ['mintable', 'burnable'],
+    ['mintable', 'pausable'],
+    ['burnable', 'pausable'],
+    ['mintable', 'burnable', 'pausable'],
+  ]
+  const caps: readonly (bigint | null)[] = [null, 0n, 999n, 1_000n, 1_000_000n]
+  let accepted = 0
+  for (const features of featureSets) {
+    for (const cap of caps) {
+      const input = { ...ORDER, cap }
+      const orderTime = outcome(() => assertBuildable(features, input))
+      const deployTime = outcome(() => {
+        const spec = variantFor(features)
+        constructorArgs(spec, input)
+      })
+      assert.equal(orderTime, deployTime, `${JSON.stringify(features)} cap=${String(cap)}`)
+      if (orderTime === 'ok') accepted += 1
+    }
+  }
+  // Not vacuous: four of the forty combinations are genuinely buildable — fixed and mintable with
+  // no cap, and foundry with a cap at or above the supply, which two of the five caps are.
+  assert.equal(accepted, 4)
+})
+
+function outcome(run: () => unknown): string {
+  try {
+    run()
+    return 'ok'
+  } catch (err) {
+    return err instanceof Error ? err.message : String(err)
+  }
+}
 
 /* ------------------------------------------------------------------ the committed bytecode */
 

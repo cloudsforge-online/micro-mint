@@ -358,6 +358,15 @@ export interface FakeLedger extends LedgerClient {
   readonly keys: readonly string[]
   failNext(err: Error): void
   refuseNext(err: Error): void
+  /**
+   * Forget everything, between cases.
+   *
+   * The fake outlives the suite's `beforeEach` — one instance is built in `before` and shared —
+   * so without this a case asserting "one debit" is really asserting "one debit in every case that
+   * ran before it too". It held only while exactly one case in the file ever paid, and the second
+   * one that did made the first fail.
+   */
+  reset(): void
 }
 
 export function fakeLedger(): FakeLedger {
@@ -369,6 +378,13 @@ export function fakeLedger(): FakeLedger {
   return {
     entries,
     keys,
+    reset() {
+      entries.length = 0
+      keys.length = 0
+      byKey.clear()
+      failure = null
+      counter = 0
+    },
     failNext(err) {
       failure = err
     },
