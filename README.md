@@ -6,6 +6,8 @@ the project page — and it owns none of the four things that make a deploy poss
 `micro-custody`'s, money is `micro-ledger`'s, chain observation is `micro-indexer`'s, and the
 contract source is `micro-contracts`'.
 
+Design authority: [`ecosystem/03-repository-responsibilities.md`](https://github.com/cloudsforge-online/micro-docs/blob/main/ecosystem/03-repository-responsibilities.md)
+
 > **`POST /v1/tokens/:id/deploy` answers 202 and a status URL. It reaches no chain.** The whole
 > handler is authenticate, check the mainnet allowlist, one conditional UPDATE to confirm the order
 > can be deployed, one enqueue, and a `Location` header — it cannot take more than a few
@@ -371,3 +373,10 @@ the committed-bytecode reproduction, the estate rules, and `indexer-routes` — 
 
   Any row it returns whose `status` is past `awaiting_payment` is a customer who has paid for a
   token that cannot be built. That is a refund decision and an operator's, not a migration.
+
+---
+
+## Provenance
+
+The code in this repository was written by **Claude Opus 5** and **Claude Fable 5**, under
+human direction and review.
