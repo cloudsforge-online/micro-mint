@@ -31,6 +31,7 @@
  */
 
 import type { Network } from '@cloudsforge/contracts-chain'
+import { parseAccountSubject } from '@cloudsforge/contracts-money'
 import { withOutbox, type Db, type Emit, type Tx } from './outbox.ts'
 import type { ChainId } from './chains.ts'
 import type { Feature } from './catalogue.ts'
@@ -251,10 +252,64 @@ export interface CreateToken {
   readonly correlationId: string
 }
 
+/**
+ * The bare user id inside an account subject, or null when the owner is not a person.
+ *
+ * `ownerSubject` is `@cloudsforge/contracts-money`'s `AccountSubject` — `user:<uuid>`,
+ * `organisation:<uuid>`, `community:<uuid>` or a singleton such as the treasury. Every consumer that
+ * needs to reach a PERSON wants the bare uuid, so the unwrapping happens once, here, rather than
+ * four times in four repositories that each guess at the prefix.
+ *
+ * `parseAccountSubject` throws on a malformed subject, which would abort a deploy that has already
+ * confirmed on chain — the money is spent and the contract exists, so refusing to record it is the
+ * worst possible response. A subject this service cannot parse means "no person", which is the same
+ * safe answer as an organisation.
+ */
+function userIdOfSubject(subject: string): string | null {
+  try {
+    const parsed = parseAccountSubject(subject)
+    return parsed.kind === 'user' ? parsed.id : null
+  } catch {
+    return null
+  }
+}
+
 export const CREATED_TOPIC = 'mint.token.created'
 export const PAID_TOPIC = 'mint.token.paid'
 export const BROADCAST_TOPIC = 'mint.token.broadcast'
-export const DEPLOYED_TOPIC = 'mint.token.deployed'
+/**
+ * Registered as `mint.deploy.confirmed` — one of the eight FIRST topics of 02-target-architecture §5.
+ *
+ * ══════════════════════════════════════════════════════════════════════════════════════════════
+ * **THIS SERVICE EMITTED THE ESTATE'S MOST-CONSUMED MINT EVENT UNDER A NAME NOBODY KNEW.** The
+ * registry has owned `mint.deploy.confirmed` since before this service existed, and this line said
+ * `mint.token.deployed`. That is the `custody.key.exported` shape exactly: custody looked like
+ * "nobody emits this" while it was in fact emitting `custody.export.completed` — a name in no
+ * registry with no subscriber — and the repair was a RENAME IN THE ONE REPOSITORY rather than five
+ * consumers learning a second name.
+ *
+ * The evidence that it is a rename and not a missing emit is that the two are the same fact, and
+ * that nothing anywhere reads the name this service used. `grep -rn 'mint.token.deployed'` across
+ * all 58 repositories returns this declaration, this repository's own tests, and one unrelated
+ * fixture in `community/src/server.test.ts:632` that uses it as an example of a topic community does
+ * NOT subscribe to. Nobody was listening. Meanwhile the registered name is read in four places:
+ *
+ *   - `notify/src/catalogue.ts:568` — priority HIGH, template `token.deployed`, and its own `why`
+ *     says it "is the event that retires ForgeMint's four-second client poll".
+ *   - `activity/src/classify.ts:838` — `token.deploy_confirmed`, user-visible.
+ *   - `analytics/src/catalogue.ts:321` — `token_deployed`, personal, feeding metrics 8 and 9
+ *     (`docs/ecosystem/13-operational-model.md:623`, token creation and its funnel).
+ *   - `docs/ecosystem/07-dependency-map.md:176` and `02-target-architecture.md:704` both list
+ *     activity, market, notify and analytics as consumers.
+ *
+ * All four were dead code, and the client kept polling every four seconds.
+ *
+ * The constant keeps its name because "deployed" is what this service does and what the row's status
+ * is called; the WIRE name is the registry's, because the registry is the only place a topic name is
+ * spelled. The registry's `keyedBy` is `token_id`, which is what this emit already passed.
+ * ══════════════════════════════════════════════════════════════════════════════════════════════
+ */
+export const DEPLOYED_TOPIC = 'mint.deploy.confirmed'
 export const FAILED_TOPIC = 'mint.token.failed'
 
 export async function createToken(
@@ -545,6 +600,56 @@ export async function markBroadcast(
 }
 
 /**
+ * The payload of `mint.deploy.confirmed`, as a pure function of the row.
+ *
+ * **Pulled out of the emit so that a test with no database can call it.** The estate's two recipient
+ * readers are run over this in `topics.test.ts`; leaving it inline meant the only check that could
+ * see it needed a real Postgres and a real deploy, and a guard that needs a database to fail is a
+ * guard that is skipped exactly when somebody is in a hurry. `deploy.test.ts` still runs the readers
+ * over the row the REAL path wrote — the two are complementary, not duplicates: this one proves the
+ * shape, that one proves the shape survives the database and the wire.
+ */
+export function deployConfirmedPayload(token: TokenRecord): Record<string, unknown> {
+  return {
+    tokenId: token.id,
+    ownerSubject: token.ownerSubject,
+    /**
+     * **THE PERSON, WHICH IS A DIFFERENT QUESTION FROM THE NAME.**
+     *
+     * Renaming the topic is only half the repair. `notify`'s rule for it is `forUser`, and
+     * `userIdOf` (`notify/src/catalogue.ts:120`) looks for a bare uuid under `user_id`/`userId`,
+     * then falls back to the envelope key only when the registry keys the topic by `user_id` — this
+     * one is keyed by `token_id` — and finally to an actor of `user:<id>`. This emit is reached from
+     * a leased deploy job, so the actor is `service:mint` (`deploy.ts:309`). `activity`'s classifier
+     * reads `userId` as a bare uuid too (`classify.ts:112`).
+     *
+     * The payload carried `ownerSubject`, which is `user:<uuid>` — a SUBJECT, not a user id — so
+     * every reader in the estate would have found nobody and a HIGH-priority notification would have
+     * answered `no_recipient` for every deploy for ever. That is precisely the defect `micro-org`
+     * records for `settlement.outbound.failed` and `market.offer.made`
+     * (`org/tools/estate-topic-gaps.json`), where the topic is correct and the envelope names nobody
+     * notify could address. One field closes it, so it is closed here rather than filed.
+     *
+     * Null when the owner is not a person. A token owned by an organisation has no single user, and
+     * guessing one would put somebody else's deploy in a member's feed — `activity` resolves a null
+     * to "no user" and files the record internal, which is the honest answer.
+     */
+    userId: userIdOfSubject(token.ownerSubject),
+    ownerAddress: token.ownerAddress,
+    chain: token.chain,
+    network: token.network,
+    contractAddress: token.contractAddress,
+    txHash: token.deployTxHash,
+    symbol: token.symbol,
+    // Both consumers render a name before falling back to the symbol — `activity`'s summary is
+    // "<name> is live at <address>" (`classify.ts:844`) and notify's `tokenName` tries `token_name`,
+    // `tokenName`, `name`, then `symbol` (`catalogue.ts:576`). The column exists and simply was not
+    // on the event, so every notification would have read "Your token".
+    name: token.name,
+  }
+}
+
+/**
  * Terminal success, with its event in the same transaction.
  *
  * Guarded on the HASH as well as the lease. That is `applyDeploySettlement`'s shape from the
@@ -584,16 +689,7 @@ export async function markDeployed(
     emit({
       topic: DEPLOYED_TOPIC,
       key: token.id,
-      payload: {
-        tokenId: token.id,
-        ownerSubject: token.ownerSubject,
-        ownerAddress: token.ownerAddress,
-        chain: token.chain,
-        network: token.network,
-        contractAddress: token.contractAddress,
-        txHash: token.deployTxHash,
-        symbol: token.symbol,
-      },
+      payload: deployConfirmedPayload(token),
       actor: input.actor,
       correlationId: input.correlationId,
     })

@@ -17,7 +17,16 @@
  * measured conditions under which that stops being true.
  */
 
-import { createHmac, timingSafeEqual } from 'node:crypto'
+import {
+  EVENT_ID_HEADER,
+  SIGNATURE_HEADER,
+  TOPIC_HEADER,
+  classifyEnvelope,
+  signDelivery,
+  verifyDelivery,
+  type EventEnvelope,
+  type EventVersion,
+} from '@cloudsforge/contracts-events'
 import type { Sql, TransactionSql } from 'postgres'
 import { HttpClient } from '@cloudsforge/http'
 import type { Logger } from '@cloudsforge/telemetry'
@@ -38,18 +47,26 @@ export interface DomainEvent {
   readonly version?: number
 }
 
-/** The wire envelope. Additive-only, versioned per topic, schema-diff enforced — AD-02. */
-export interface EventEnvelope {
-  readonly id: string
-  readonly topic: string
-  readonly key: string
-  readonly occurredAt: string
-  readonly producer: string
-  readonly version: number
-  readonly actor: string | null
-  readonly correlationId: string | null
-  readonly payload: Record<string, unknown>
-}
+/**
+ * The wire envelope is `@cloudsforge/contracts-events`' — re-exported, not redeclared.
+ *
+ * The local copy that used to sit here typed `version` as a NUMBER and `actor`/`correlationId` as
+ * nullable, and the relay sent all three straight through. The contract types the version
+ * `${number}.${number}` and requires a non-null actor and correlation id, so **every event this
+ * service has ever relayed was refused at the envelope**, however correct its signature was —
+ * exactly what happened to `market`, `trade`, `community` and `devplatform`, and invisible for the
+ * same reason: every suite tests against its own fake bus. Importing the type makes it a compile
+ * error rather than a silent nothing.
+ */
+export type { EventEnvelope } from '@cloudsforge/contracts-events'
+
+/**
+ * The wire version, in the CONTRACT's shape.
+ *
+ * The stored column stays an integer — storage records the major — and the mapping to the
+ * contract's `` `${number}.${number}` `` happens here, at the wire, in one place.
+ */
+const wireVersion = (v: number): EventVersion => `${v}.0`
 
 export type Emit = (event: DomainEvent) => void
 
@@ -98,22 +115,99 @@ export async function withOutbox<T>(
 
 /* ------------------------------------------------------------------------ signing */
 
-const SIGNATURE_HEADER = 'x-cloudsforge-signature'
-
-/** `sha256=<hex>` over the exact bytes sent, so a subscriber verifies before parsing. */
+/**
+ * THE CONTRACT SIGNS, NOT THIS FILE.
+ *
+ * This was a local `sha256=<hmac over the body>` under a locally-declared `x-cloudsforge-signature`.
+ * The contract signs `t=<seconds>,v1=<hmac over "<seconds>.<body>">` under `cf-signature`, and every
+ * consumer that imports it verifies exactly that — so a delivery from here was refused before the
+ * body was read, first as "signature: missing" and, once a header name was aligned, as
+ * `malformed_header`.
+ *
+ * The timestamp is INSIDE the signed message rather than beside it, so it cannot be moved without
+ * invalidating the signature, which is what makes a subscriber's freshness window mean anything. The
+ * old scheme had no timestamp at all and therefore no replay bound: a captured delivery was a
+ * permanent credential.
+ *
+ * The exported names stay, so no call site changes; the implementations are the contract's, so they
+ * cannot drift again.
+ */
 export function signEvent(body: string, secret: string): string {
-  return `sha256=${createHmac('sha256', secret).update(body).digest('hex')}`
+  return signDelivery(body, secret)
 }
 
-/** Timing-safe, because a byte-at-a-time comparison of a MAC is a byte-at-a-time forgery oracle. */
+/** Timing-safety and the freshness window both live in the contract's verifier. */
 export function verifyEventSignature(body: string, secret: string, presented: string): boolean {
-  const expected = Buffer.from(signEvent(body, secret))
-  const actual = Buffer.from(presented)
-  if (expected.length !== actual.length) return false
-  return timingSafeEqual(expected, actual)
+  return verifyDelivery(body, presented, secret).ok
 }
 
 /* ------------------------------------------------------------------------ relay */
+
+/**
+ * The envelope as this file can prove it at COMPILE time, before the classifier looks at it.
+ *
+ * `version` is the contract's `EventVersion`, so `version: row.version` — the stored integer, which
+ * is what this relay actually sent — is a type error rather than a test failure. `actor` and
+ * `correlationId` are non-nullable, so the nullable columns cannot be passed through without a
+ * decision being made about them here.
+ *
+ * `topic` and `producer` stay `string`: they are a `TopicName` and a `ProducerService` on the wire
+ * but free text in the table, and a cast asserting them would be the producer vouching for itself.
+ */
+interface EnvelopeCandidate {
+  readonly id: string
+  readonly topic: string
+  readonly key: string
+  readonly occurredAt: string
+  readonly producer: string
+  readonly version: EventVersion
+  readonly actor: string
+  readonly correlationId: string
+  readonly payload: Record<string, unknown>
+}
+
+/**
+ * An outbox row, as the contract's envelope — or the reasons it is not one.
+ *
+ * Built here and handed to the CONTRACT'S OWN classifier, so the relay's idea of a valid event and a
+ * subscriber's are the same function. `system` for a missing actor is the contract's own value for
+ * "no principal did this" — a leased deploy job — and a missing correlation id falls back to the
+ * event id, because an absent one is where a cross-service investigation stops.
+ *
+ * ## Why `classifyEnvelope` and not `validateEnvelope`
+ *
+ * `validateEnvelope` refuses an unregistered topic, and FOUR of this service's five topics are
+ * unregistered — only `mint.deploy.confirmed` is in the registry. Refusing on that basis would stop
+ * relaying four topics that work. `classifyEnvelope` separates the two facts the contract insists
+ * are different: `unregistered_topic` is a MISSING REGISTRATION (quarantine, do not drop) and
+ * `malformed` is a PRODUCER BUG (refuse, today). `src/topics.ts` is what stops "unregistered"
+ * becoming a blanket excuse — every topic emitted here must be registered or in that file's
+ * self-emptying quarantine, or `topics.test.ts` is red.
+ */
+export function buildEnvelope(
+  row: OutboxRow,
+):
+  | { ok: true; value: EventEnvelope; unregisteredTopic: string | null }
+  | { ok: false; defects: readonly string[] } {
+  const candidate: EnvelopeCandidate = {
+    id: row.id,
+    topic: row.topic,
+    key: row.key,
+    occurredAt: row.occurred_at.toISOString(),
+    producer: row.producer,
+    version: wireVersion(row.version),
+    actor: row.actor ?? 'system',
+    correlationId: row.correlation_id ?? row.id,
+    payload: row.payload,
+  }
+  const verdict = classifyEnvelope(candidate)
+  if (verdict.reason === 'malformed') return { ok: false, defects: verdict.defects }
+  return {
+    ok: true,
+    value: candidate as unknown as EventEnvelope,
+    unregisteredTopic: verdict.unregisteredTopic,
+  }
+}
 
 export interface RelayDeps {
   readonly sql: Db
@@ -125,7 +219,13 @@ export interface RelayDeps {
   readonly clientFor?: (url: string) => Pick<HttpClient, 'request'>
 }
 
-interface OutboxRow {
+/**
+ * A stored outbox row, exported because `buildEnvelope` is.
+ *
+ * The suite selects a row the real deploy path wrote and hands it to `buildEnvelope`, which is the
+ * only way to check the wire shape against a row nothing in the test constructed.
+ */
+export interface OutboxRow {
   readonly id: string
   readonly topic: string
   readonly key: string
@@ -183,17 +283,32 @@ export function createRelay(deps: RelayDeps): Handler {
         select id, url from event_subscriptions where topic = ${event.topic} and active = true
       `
 
-      const envelope: EventEnvelope = {
-        id: event.id,
-        topic: event.topic,
-        key: event.key,
-        occurredAt: event.occurred_at.toISOString(),
-        producer: event.producer,
-        version: event.version,
-        actor: event.actor,
-        correlationId: event.correlation_id,
-        payload: event.payload,
+      const built = buildEnvelope(event)
+      if (!built.ok) {
+        // REFUSED HERE RATHER THAN SENT. An envelope the contract rejects is one every subscriber
+        // rejects, so relaying it burns a retry budget delivering something nobody can accept — and
+        // four other services shipped exactly that for weeks without noticing, because their suites
+        // verified against their own fake buses.
+        //
+        // Logged and SKIPPED, not published: the row stays unpublished so the defect is visible in
+        // the backlog and is delivered once whatever produced it is fixed, rather than being
+        // silently marked done.
+        deps.logger.error('outbox row is not a valid envelope; not relayed', {
+          eventId: event.id,
+          topic: event.topic,
+          defects: built.defects,
+        })
+        continue
       }
+      if (built.unregisteredTopic !== null) {
+        // Not an error and not a page: a topic this service emits and has proposed, which every
+        // consumer will quarantine until contracts adopts it. `src/topics.ts` holds the spec.
+        deps.logger.info('relaying a topic the shared registry does not yet name', {
+          eventId: event.id,
+          topic: built.unregisteredTopic,
+        })
+      }
+      const envelope = built.value
       // Signed over the exact bytes `HttpClient` will send: it stringifies the same object with
       // the same key order, so the MAC a subscriber recomputes over the received body matches.
       const signature = signEvent(JSON.stringify(envelope), deps.signingSecret)
@@ -263,7 +378,11 @@ async function deliver(
       // The event id is the idempotency key, which is what makes this POST safe to retry and is
       // the same value the subscriber dedupes on.
       idempotencyKey: envelope.id,
-      headers: { [SIGNATURE_HEADER]: signature, 'x-event-id': envelope.id },
+      headers: {
+        [SIGNATURE_HEADER]: signature,
+        [EVENT_ID_HEADER]: envelope.id,
+        [TOPIC_HEADER]: envelope.topic,
+      },
       ...(envelope.correlationId ? { requestId: envelope.correlationId } : {}),
     })
     await deps.sql`

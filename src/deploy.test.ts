@@ -12,7 +12,9 @@ import test, { after, before, beforeEach } from 'node:test'
 import type postgres from 'postgres'
 import { driveDeploy } from './deploy.ts'
 import { NotImplementedError, familyFor, isImplemented } from './families.ts'
-import { claimDeploy, findToken, listAttempts } from './tokens.ts'
+import { BROADCAST_TOPIC, DEPLOYED_TOPIC, claimDeploy, findToken, listAttempts } from './tokens.ts'
+import { buildEnvelope, type OutboxRow } from './outbox.ts'
+import { activityRecipient, envelopeDefects, notifyRecipient } from './topics.ts'
 import { createAddress, evmTxHash } from './evm.ts'
 import {
   deployerFor,
@@ -92,14 +94,53 @@ test('the deployed event names the CUSTOMER as owner, never the deployer', { ski
   const events = await sql<{ topic: string; payload: Record<string, unknown> }[]>`
     select topic, payload from outbox where key = ${id} order by occurred_at
   `
-  const deployed = events.find((e) => e.topic === 'mint.token.deployed')
+  // The REGISTERED name. This read `'mint.token.deployed'` — the name this service invented and
+  // nothing in the estate subscribed to — so it passed while notify, activity and analytics all sat
+  // on a topic that never arrived.
+  const deployed = events.find((e) => e.topic === DEPLOYED_TOPIC)
   assert.ok(deployed)
+  assert.equal(deployed.topic, 'mint.deploy.confirmed')
   // The gas payer and the owner are different accounts, and this is the assertion that says so.
   assert.notEqual(deployed.payload['ownerAddress'], deployerFor(id))
   assert.equal(
     (deployed.payload['ownerAddress'] as string).toLowerCase(),
     '0x00000000000000000000000000000000000000a1',
   )
+
+  /* -------------------------------------------------------------------------------------------
+   * **THE PERSON, off a REAL row rather than a fixture.** `topics.test.ts` runs the estate's two
+   * recipient readers over a constructed payload; this runs them over the payload the real deploy
+   * path wrote, through the relay's own builder and the JSON round trip that is the wire. A field
+   * assigned `undefined` is indistinguishable from an absent one after that round trip, which is
+   * exactly how "the payload has a userId" can be true in a test and false in production.
+   * ----------------------------------------------------------------------------------------- */
+  const stored = await sql<OutboxRow[]>`
+    select id, topic, key, occurred_at, producer, version, actor, correlation_id, payload
+      from outbox where key = ${id} and topic = ${DEPLOYED_TOPIC}
+  `
+  const row = stored[0]
+  assert.ok(row)
+  assert.equal(row.key, id, 'keyed by token_id, which is what the registry declares')
+
+  const built = buildEnvelope(row)
+  assert.ok(built.ok, 'the relay would refuse the envelope it built from a real deploy')
+  const delivered = JSON.parse(JSON.stringify(built.value)) as {
+    topic: string
+    key: string
+    actor: string
+    payload: Record<string, unknown>
+  }
+  assert.deepEqual(
+    envelopeDefects(delivered),
+    [],
+    'a real confirmed deploy would be refused at the envelope by every consumer in the estate',
+  )
+  // The actor is the SERVICE, because this runs in a leased deploy job — so notify's actor fallback
+  // finds nobody and the payload field is the only thing that can name a person.
+  assert.equal(delivered.actor, 'service:mint')
+  const owner = String(delivered.payload['ownerSubject']).slice('user:'.length)
+  assert.equal(activityRecipient(delivered.payload), owner, 'this deploy is in nobody’s feed')
+  assert.equal(notifyRecipient(delivered), owner, 'this deploy notifies nobody')
 })
 
 test('the broadcast event carries the contract address, DERIVED before the send', { skip }, async () => {
@@ -107,7 +148,7 @@ test('the broadcast event carries the contract address, DERIVED before the send'
   const h = harness(sql, { node: funded(id) })
   await driveDeploy(h.deploy, id)
   const events = await sql<{ topic: string; payload: Record<string, unknown> }[]>`
-    select topic, payload from outbox where key = ${id} and topic = 'mint.token.broadcast'
+    select topic, payload from outbox where key = ${id} and topic = ${BROADCAST_TOPIC}
   `
   assert.equal(events[0]?.payload['contractAddress'], createAddress(deployerFor(id), 0n))
   assert.ok(events[0]?.payload['txHash'])
