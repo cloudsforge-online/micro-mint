@@ -197,7 +197,17 @@ A dead-lettered recurring job is deliberately not re-armed (`src/jobs.ts:101-103
 
 `.env.example` and `src/env.ts` were cross-checked and **agree**: every variable `loadEnv` reads is
 present, defaults included, and the file names nothing the service does not read. `OUTBOX_SIGNING_SECRET`
-and `MINT_SERVICE_TOKEN` ship **empty**, so a copied file refuses to boot until they are filled.
+and `MINT_IDENTITY_CREDENTIAL` ship **empty**, so a copied file refuses to boot until they are
+filled.
+
+**`MINT_SERVICE_TOKEN` is retired.** It was a service *token*, and a service token expires in 600
+seconds (`identity/src/tokens.ts:28`). This service read one once at boot and nothing re-minted it,
+so ten minutes into every deployment custody, the indexer and the ledger refused every call — and
+`custody:sign:deployer` is how a contract gets deployed, so the symptom looked like custody being
+broken rather than like this service holding a corpse. What a container holds at rest is now a
+*credential*: long-lived, revocable, worth nothing by itself, exchanged for an ordinary ten-minute
+token whenever one is needed. Setting the old variable is logged as ignored at boot. See
+`src/upstreams.ts` and `@cloudsforge/auth`.
 
 | Variable | Default | If it is wrong or missing |
 | --- | --- | --- |
@@ -214,7 +224,9 @@ and `MINT_SERVICE_TOKEN` ship **empty**, so a copied file refuses to boot until 
 | `CUSTODY_URL` | — | **required**. No signature, no deploy (`src/env.ts:264`) |
 | `INDEXER_URL` | — | **required** (`src/env.ts:265`) |
 | `LEDGER_URL` | — | **required**. No debit, no order (`src/env.ts:266`) |
-| `MINT_SERVICE_TOKEN` | — | **required, ≥24 chars.** The scoped service credential — **not shared**, SD-05 (`src/env.ts:267`, `:175`) |
+| `MINT_IDENTITY_CREDENTIAL` | — | **≥24 chars, `cfsc_…`.** The long-lived credential exchanged at `POST /service-tokens/exchange` for a ten-minute token — **not shared**, SD-05. Technically optional so the image can boot for CI's `/livez` smoke test, but `/readyz` fails hard without it and every peer call 503s |
+| `IDENTITY_URL` | `IDENTITY_ISSUER` | where the credential is exchanged. Only set it where the issuer and the dialled address genuinely differ |
+| `MINT_SERVICE_TOKEN` | — | **retired.** A 600-second token read once at boot. If still set, boot logs that it is ignored |
 | `MINT_UPSTREAM_DEADLINE_MS` | `5000` | 100–60000 (`src/env.ts:268`) |
 | `MINT_RPC_URLS` | `{}` | `chain → JSON-RPC endpoint` as JSON. **Empty means a chain with no endpoint refuses rather than falling back to a public node nobody chose** (`src/env.ts:270`, `:179-182`). A malformed value is refused at boot, because a silently-empty map is an outage that presents as "every deploy on every chain is refused for want of an endpoint" — a long way from the typo that caused it (`src/env.ts:112-117`) |
 | `MINT_RPC_DEADLINE_MS` | `5000` | 100–60000 (`src/env.ts:271`) |

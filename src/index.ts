@@ -21,7 +21,7 @@
 import postgres from 'postgres'
 import { assertSchemaAtLeast, type Sql as DbSql } from '@cloudsforge/db'
 import { JobQueue, JobRunner, type Sql as JobsSql } from '@cloudsforge/jobs'
-import { Verifier } from '@cloudsforge/auth'
+import { Verifier, serviceTokenProbe } from '@cloudsforge/auth'
 import { HttpClient } from '@cloudsforge/http'
 import { Lifecycle, httpProbe, installSignalHandlers, postgresProbe } from '@cloudsforge/lifecycle'
 import { Logger, Metrics, registerHttpMetrics, registerJobMetrics } from '@cloudsforge/telemetry'
@@ -29,9 +29,7 @@ import { SERVICE, env } from './env.ts'
 import { SCHEMA_VERSION } from './migrations.ts'
 import { createServer, registerServiceMetrics } from './server.ts'
 import { registerHandlers, rescheduleRecurring, seedRecurring } from './jobs.ts'
-import { httpCustodyClient } from './custodyclient.ts'
-import { httpIndexerClient } from './indexerclient.ts'
-import { httpLedgerClient } from './ledgerclient.ts'
+import { buildUpstreams } from './upstreams.ts'
 import { CHAIN_IDS, type ChainId } from './chains.ts'
 import { isImplemented } from './families.ts'
 import type { JsonRpc } from './evm.ts'
@@ -87,25 +85,48 @@ try {
   process.exit(1)
 }
 
-// 5. The upstreams. Constructed before the Lifecycle so its probes can close over their URLs, and
-//    all three take the same scoped service token — never a shared one (SD-05).
-const token = () => env.serviceToken
-const custody = httpCustodyClient({
-  baseUrl: env.custodyUrl,
-  token,
-  deadlineMs: env.upstreamDeadlineMs,
-})
-const indexer = httpIndexerClient({
-  baseUrl: env.indexerUrl,
-  token,
-  deadlineMs: env.upstreamDeadlineMs,
-})
-const ledger = httpLedgerClient({
-  baseUrl: env.ledgerUrl,
-  token,
-  deadlineMs: env.upstreamDeadlineMs,
+// 5. The upstreams, and the credential that authenticates every call to them. Constructed before
+//    the Lifecycle so its probes can close over them. The wiring itself lives in `./upstreams.ts`
+//    and is covered by `servicetoken.test.ts` — it was untestable here, and what was untestable
+//    here was wrong for months. See that file. The per-chain RPC clients below are deliberately
+//    NOT given a token: they dial public chain nodes outside this estate.
+const { identityTokens, custody, indexer, ledger } = buildUpstreams(env, {
   originatingService: SERVICE,
+  onEvent: (event) => {
+    if (event.kind === 'exchange_failed') {
+      // `warn`, not `error`, while a usable token is still held: the 20% slack after the refresh
+      // point exists precisely so a few of these are survivable and uninteresting.
+      const level = event.hadUsableToken ? 'warn' : 'error'
+      logger[level]('service token exchange failed', {
+        err: event.err,
+        hadUsableToken: event.hadUsableToken,
+      })
+    } else if (event.kind === 'minted') {
+      logger.info('service token minted', {
+        service: event.service,
+        expiresIn: event.expiresIn,
+        refreshInMs: event.refreshInMs,
+      })
+    } else {
+      logger.warn('service token', { event: event.kind, url: event.url })
+    }
+  },
 })
+
+if (!identityTokens) {
+  // Not `fatal` and exit: the image must be able to boot without this so CI's startup smoke test
+  // can read /livez, and a service that refuses to start is a service whose logs nobody reads.
+  // `/readyz` is where the absence is enforced — the `identity-credential` probe below is hard,
+  // so an unconfigured replica takes no traffic.
+  logger.error('MINT_IDENTITY_CREDENTIAL is not set; every call to a peer will fail 503', {
+    hint: 'deploy/scripts/estate-bootstrap.sh writes it to compose/estate/tokens.env',
+  })
+}
+if (env.legacyServiceTokenPresent) {
+  logger.error('MINT_SERVICE_TOKEN is set and is IGNORED', {
+    hint: 'it was a 600-second token read once at boot; MINT_IDENTITY_CREDENTIAL replaces it',
+  })
+}
 
 /**
  * One JSON-RPC client per chain, built once so a circuit breaker accumulates state across ticks.
@@ -165,6 +186,11 @@ lifecycle
     ),
   )
   .addProbe(httpProbe('identity-jwks', env.identityJwksUrl, { kind: 'soft' }))
+  // HARD, unlike the soft upstream probes below. It does not report a peer having a bad minute —
+  // it fails only when no credential is configured at all, which is a deployment that cannot sign
+  // a single deploy and will not fix itself. An identity OUTAGE returns warn, deliberately, so one
+  // bad minute in identity does not empty every balancer in the estate.
+  .addProbe(serviceTokenProbe(identityTokens))
   // SOFT, all three. Custody being down means no new signature can be made — but this service must
   // stay in its balancer to keep ADVANCING deploys that are already signed, which is the state
   // where a customer's gas is actually at risk. Marking any of them hard would remove mint from

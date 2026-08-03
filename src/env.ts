@@ -80,6 +80,26 @@ function requiredSecret(source: Source, name: string, minLength = 24): string {
   return value
 }
 
+/**
+ * A secret that may be absent, but must be real if present.
+ *
+ * The distinction matters for the identity credential: absent is a deployment that has not been
+ * given one yet and is reported by `/readyz`; a short placeholder is a deployment that believes it
+ * HAS one, and would fail on its first call to a peer with a 401 that reads as "identity rejected
+ * this service" rather than "nobody set this variable".
+ */
+function optionalSecret(source: Source, name: string, minLength = 24): string | null {
+  const value = source[name]?.trim()
+  if (!value) return null
+  if (PLACEHOLDERS.has(value.toLowerCase())) {
+    throw new EnvError(`${name} is set to a known placeholder — generate a real secret`)
+  }
+  if (value.length < minLength) {
+    throw new EnvError(`${name} must be at least ${minLength} characters (got ${value.length})`)
+  }
+  return value
+}
+
 function optional(source: Source, name: string, fallback: string): string {
   const value = source[name]?.trim()
   return value && value.length > 0 ? value : fallback
@@ -172,8 +192,45 @@ export interface Env {
   readonly custodyUrl: string
   readonly indexerUrl: string
   readonly ledgerUrl: string
-  /** The scoped service credential. Not shared: SD-05. */
-  readonly serviceToken: string
+
+  /**
+   * Where identity is, for `POST /service-tokens/exchange`.
+   *
+   * Defaults to `IDENTITY_ISSUER`, which is already required and is identity's own base URL — the
+   * issuer of a token is by definition where the token came from. `IDENTITY_URL` overrides it for a
+   * deployment where the two genuinely differ. Deriving rather than demanding a fourth identity
+   * variable keeps them in step: pointing the exchange at one identity and trusting the JWKS of
+   * another fails with a signature error nobody reads as a configuration mistake.
+   */
+  readonly identityUrl: string
+
+  /**
+   * **The long-lived credential this service exchanges for short-lived tokens.**
+   *
+   * It replaces `MINT_SERVICE_TOKEN`, which was a 600-second token read once at boot
+   * (identity/src/tokens.ts:28). Ten minutes into any deployment it expired and every call to a
+   * peer failed; nothing could re-mint it, because minting requires the `admin` role. A credential
+   * is not a token: it confers nothing by itself, it is revocable, and it survives a restart. See
+   * `micro-identity` `src/serviceCredentials.ts` and `@cloudsforge/auth` `ServiceTokenProvider`.
+   *
+   * OPTIONAL, AND DELIBERATELY SO — but not "unconfigured is fine". It is optional because the
+   * image must be able to BOOT without one: CI's startup smoke test builds the container, migrates
+   * it and reads `/livez`, and that job's environment is fixed in a workflow file. Making this
+   * required would fail that job rather than this service.
+   *
+   * The absence is not silent. `/readyz` reports the `identity-credential` probe as a HARD failure,
+   * so an unconfigured replica never takes traffic, and every upstream call fails closed with 503
+   * rather than being sent unauthenticated.
+   */
+  readonly identityCredential: string | null
+
+  /**
+   * Whether the retired `MINT_SERVICE_TOKEN` is still set.
+   *
+   * Read for exactly one purpose: to say so at boot. An operator who redeploys with the old
+   * variable and not the new one would otherwise get a service that looks configured and is not.
+   */
+  readonly legacyServiceTokenPresent: boolean
   readonly upstreamDeadlineMs: number
 
   /**
@@ -264,7 +321,11 @@ export function loadEnv(source: Source = process.env, host = ''): Env {
     custodyUrl: required(source, 'CUSTODY_URL'),
     indexerUrl: required(source, 'INDEXER_URL'),
     ledgerUrl: required(source, 'LEDGER_URL'),
-    serviceToken: requiredSecret(source, 'MINT_SERVICE_TOKEN'),
+    identityUrl: optional(source, 'IDENTITY_URL', required(source, 'IDENTITY_ISSUER')),
+    // Not `requiredSecret`: see the field comment. The absence is caught by `/readyz`, which is
+    // a check that can fail, rather than by a boot CI cannot perform.
+    identityCredential: optionalSecret(source, 'MINT_IDENTITY_CREDENTIAL'),
+    legacyServiceTokenPresent: (source['MINT_SERVICE_TOKEN']?.trim() ?? '').length > 0,
     upstreamDeadlineMs: integer(source, 'MINT_UPSTREAM_DEADLINE_MS', 5_000, 100, 60_000),
 
     rpcUrls: jsonMap(source, 'MINT_RPC_URLS', '{}'),
