@@ -35,7 +35,9 @@
  */
 
 import { parseAccountSubject } from '@cloudsforge/contracts-money'
+import type { IssuableAssetCode } from '@cloudsforge/contracts-chain'
 import { withOutbox, type Db } from './outbox.ts'
+import type { PricingClient } from './pricingclient.ts'
 import {
   deployPostings,
   orderIdempotencyKey,
@@ -65,6 +67,15 @@ export class OrderStateError extends Error {
 export interface PayDeps {
   readonly sql: Db
   readonly ledger: LedgerClient
+  /**
+   * Reads the USD→EMBER rate. **Fails the payment rather than guessing** — see `pricingclient.ts`.
+   *
+   * A real availability coupling, and the correct one: the order is quoted in dollars and the
+   * ledger is posted in EMBER, and nothing can turn the first into the second without a rate.
+   */
+  readonly pricing: PricingClient
+  /** What the customer is charged in. `IssuableAssetCode`, so it can never be a retired code. */
+  readonly settlementAsset: IssuableAssetCode
   readonly producer: string
 }
 
@@ -102,9 +113,25 @@ export async function payForDeploy(deps: PayDeps, request: PayRequest): Promise<
   // Validated with the ledger's own parser so the two cannot disagree about what a subject is.
   parseAccountSubject(request.ownerSubject)
 
+  // ══════════════════════════════════════════════════════════════════════════════════════════════
+  // THE PRICE IS READ BEFORE THE TRANSACTION OPENS, AND THAT PLACEMENT IS DELIBERATE.
+  //
+  // The quote is a network call to micro-pricing that can fail. Failing it here leaves nothing to
+  // unwind — no row is locked, no connection is held, and the customer gets a 503 having been
+  // charged nothing. Inside `withOutbox` it would sit in the same transaction as the ledger post,
+  // holding a database connection across a SECOND upstream and lengthening the window in which a
+  // row is locked FOR UPDATE. This is the placement `billing/src/purchases.ts` argues for and the
+  // reasoning transfers unchanged.
+  //
+  // The cost of reading it early is that the price is quoted a few milliseconds before the debit
+  // rather than inside it. That is the right trade: the rate is administered and does not move
+  // between two statements, and the figure that was used is written onto the row either way.
+  // ══════════════════════════════════════════════════════════════════════════════════════════════
+  const priced = await priceOf(deps, request)
+
   return withOutbox(deps.sql, deps.producer, async (tx, emit) => {
-    const rows = await tx<{ id: string; status: string; price_shards: string; paid_journal_entry_id: string | null }[]>`
-      select id, status, price_shards, paid_journal_entry_id
+    const rows = await tx<{ id: string; status: string; paid_journal_entry_id: string | null }[]>`
+      select id, status, paid_journal_entry_id
         from tokens
        where id = ${request.tokenId} and owner_subject = ${request.ownerSubject}
          for update
@@ -115,7 +142,6 @@ export async function payForDeploy(deps: PayDeps, request: PayRequest): Promise<
       throw new OrderStateError(`an order in ${row.status} cannot be paid`, row.status)
     }
 
-    const amount = BigInt(row.price_shards)
     let entry
     try {
       entry = await deps.ledger.postEntry({
@@ -126,7 +152,11 @@ export async function payForDeploy(deps: PayDeps, request: PayRequest): Promise<
         // safe to retry.
         idempotencyKey: orderIdempotencyKey(request.tokenId),
         description: `mint: token deploy ${request.tokenId}`,
-        postings: deployPostings({ subject: request.ownerSubject, amount }),
+        postings: deployPostings({
+          subject: request.ownerSubject,
+          assetCode: deps.settlementAsset,
+          amount: priced.amount,
+        }),
       })
     } catch (err) {
       // Insufficient balance is the customer's answer, not a fault. Translated here so the route
@@ -141,6 +171,9 @@ export async function payForDeploy(deps: PayDeps, request: PayRequest): Promise<
       id: request.tokenId,
       ownerSubject: request.ownerSubject,
       journalEntryId: entry.id,
+      chargeAssetCode: deps.settlementAsset,
+      chargeAmount: priced.amount,
+      rateUsdScaled: priced.usdScaled,
       actor: request.actor,
       correlationId: request.correlationId,
     })
@@ -151,4 +184,58 @@ export async function payForDeploy(deps: PayDeps, request: PayRequest): Promise<
 
     return { token, replayed: entry.replayed, journalEntryId: entry.id }
   })
+}
+
+/**
+ * What this order costs, in the unit it will be charged in.
+ *
+ * Reads the order's `price_usd_cents` — the durable figure — and converts it once, at the rate
+ * micro-pricing publishes now. Both numbers come back, because both are written onto the row: the
+ * charge is what a refund must return, and the rate is what makes the arithmetic checkable
+ * afterwards. Without the rate, the cents and the wei are two numbers with no stated relationship
+ * and nobody can tell a rate change from a bug.
+ */
+async function priceOf(
+  deps: PayDeps,
+  request: PayRequest,
+): Promise<{ readonly amount: bigint; readonly usdScaled: bigint }> {
+  const rows = await deps.sql<{ price_usd_cents: string | null; price_shards: string | null }[]>`
+    select price_usd_cents, price_shards
+      from tokens
+     where id = ${request.tokenId} and owner_subject = ${request.ownerSubject}
+  `
+  const row = rows[0]
+  if (!row) throw new OrderStateError('no such order', 'not_found')
+
+  // An order quoted only in Shards is one this build cannot honour. It predates migration 6's
+  // back-fill, which set `price_usd_cents` on every row that existed — so reaching this means the
+  // row was written by the retired build during a rollout, and the only safe answer is to refuse.
+  //
+  // Explicit, and not `BigInt(row.price_usd_cents ?? '')`: **`BigInt('')` is `0n`**, so the tidy
+  // spelling would turn a missing price into a FREE DEPLOY — a gas bill the platform pays for
+  // anyone who can open an order.
+  if (row.price_usd_cents === null) {
+    throw new OrderStateError(
+      'this order was quoted in a retired unit and cannot be paid; open a new one',
+      'awaiting_payment',
+    )
+  }
+
+  const cents = BigInt(row.price_usd_cents)
+  if (cents <= 0n) throw new OrderStateError('this order has no price to charge', 'awaiting_payment')
+
+  const quote = await deps.pricing.quote(deps.settlementAsset, cents)
+
+  // Belt and braces over `coinAmountForUsdCents`, which already refuses this. A positive price that
+  // settles to nothing is a free deploy, and the order reaches the deploy queue in the same
+  // transaction as the posting — so a zero here would spend the platform's gas for a balanced entry
+  // that moved no money.
+  if (quote.amount <= 0n) {
+    throw new OrderStateError(
+      `a price of ${cents} cents settled to ${quote.amount} — refusing to charge nothing for something`,
+      'awaiting_payment',
+    )
+  }
+
+  return { amount: quote.amount, usdScaled: quote.usdScaled }
 }

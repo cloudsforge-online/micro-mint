@@ -252,6 +252,158 @@ export const MIGRATIONS: readonly Migration[] = [
       );
     `,
   },
+
+  {
+    version: 6,
+    name: 'retire_shard_pricing',
+    up: `
+      -- ══════════════════════════════════════════════════════════════════════════════════════════
+      -- SHARDS OUT OF FORGE CREATE. The order becomes durable in USD; EMBER is settled at payment.
+      --
+      -- SHARD was retired on 2026-08-04 in micro-contracts (RETIRED_ASSETS) and micro-billing
+      -- (migration 11, 'retire_shard_prices'). THIS SERVICE WAS NOT MIGRATED WITH THEM. It went on
+      -- pricing a deploy in Shards (MINT_DEPLOY_PRICE_SHARDS), serving that number to the browser
+      -- as 'priceShards', and posting a real SHARD debit to micro-ledger. The customer's screen
+      -- said "Pay 2,500 Shards" and it was TRUE — which is why the screen could not be fixed by
+      -- relabelling it, and why this migration is the fix.
+      --
+      -- The shape is billing's, deliberately, because two services quoting the same estate in two
+      -- different bases is how a price becomes unauditable.
+      --
+      -- ── WHY USD AND NOT EMBER ───────────────────────────────────────────────────────────────
+      --
+      -- The owner's decision (docs/ecosystem/15 §3.2) is that a stated USD price does not move and
+      -- the unit changes. EMBER cannot carry a catalogue price: it has no exchange listing, so
+      -- micro-pricing carries an ADMINISTERED figure for it — a number an operator typed. Store
+      -- EMBER here and every future edit to that figure silently restates the price of a deploy,
+      -- with no migration and no record. USD is durable; how much EMBER it buys is a
+      -- settlement-time question, answered per payment and recorded on the row that used it.
+      --
+      -- ── WHY THE INTEGER DOES NOT MOVE ────────────────────────────────────────────────────────
+      --
+      -- SHARD has decimals 0. USD is held as cents, decimals 2. The documented peg is 100 Shards to
+      -- the dollar, so 100 Shards = 100 cents and ONE SHARD IS EXACTLY ONE CENT. The backfill below
+      -- is the identity on the stored number: 2,500 Shards was $25.00 and 2,500 cents is $25.00.
+      -- Nothing is multiplied, divided or rounded.
+      --
+      -- The alternative that was rejected is worth naming, because it is the plausible one:
+      -- relabelling price_shards as 'EMBER' would leave the integer 2500 to be read at 18 decimals
+      -- — 2500 wei, or 0.0000000000000025 EMBER — a price moved by eighteen orders of magnitude by
+      -- an UPDATE that touched a text column. That is the silent scale change this is not.
+      --
+      -- ── WHY THE ROW RECORDS BOTH AMOUNTS AND THE RATE ───────────────────────────────────────
+      --
+      -- price_usd_cents is what the customer was QUOTED. charge_amount is what actually left their
+      -- balance. They are two numbers, not one, and recording only the first loses what a refund
+      -- needs: a refund must return the EMBER that was TAKEN, not whatever today's administered
+      -- rate says $25.00 is worth, or a customer refunded across a rate change is refunded the
+      -- wrong amount. rate_usd_scaled is the third column for the same reason — without it,
+      -- price_usd_cents and charge_amount are two numbers with no stated relationship and nobody
+      -- can tell a rate change from a bug.
+      --
+      -- ── SUPERSEDED IN PLACE, NEVER CONVERTED, NEVER DELETED ─────────────────────────────────
+      --
+      -- price_shards stays, and stays populated on the rows that had it. It is what a past order
+      -- ACTUALLY cost; rewriting it would retroactively restate history, and it is the marker that
+      -- says which era a row belongs to — the job status='retired' does in billing's prices table.
+      -- Nothing written from here on sets it, and no money is destroyed here because none is held
+      -- here: the 69,000 units of real SHARD liability live in micro-ledger, are guarded by its
+      -- migration 13, and are drained separately.
+      -- ══════════════════════════════════════════════════════════════════════════════════════════
+
+      alter table tokens
+        add column if not exists price_usd_cents  numeric(78,0),
+        add column if not exists charge_asset_code text,
+        add column if not exists charge_amount     numeric(78,0),
+        add column if not exists rate_usd_scaled   numeric(78,0);
+
+      -- One Shard is one cent. See above; this is the identity, not a conversion.
+      update tokens set price_usd_cents = price_shards where price_usd_cents is null;
+
+      -- What a paid order was actually charged. Every order that already exists was charged in the
+      -- same unit it was priced in, at no conversion — that is what a Shard price and a Shard debit
+      -- MEANT — so rate_usd_scaled stays NULL rather than being back-filled with a 1:1 figure that
+      -- would claim a rate was consulted when none was.
+      update tokens
+         set charge_asset_code = 'SHARD',
+             charge_amount     = price_shards
+       where paid_journal_entry_id is not null
+         and charge_asset_code is null;
+
+      -- New rows state their price in the durable unit. price_shards becomes nullable rather than
+      -- being dropped, because dropping it would delete what past orders cost.
+      alter table tokens alter column price_shards drop not null;
+
+      -- ── THE GUARD ───────────────────────────────────────────────────────────────────────────
+      --
+      -- A comment does not stop an INSERT, and this service is one deploy away from being wrong
+      -- while the row outlives the deploy. No order CREATED from here on may be charged in a
+      -- retired asset, whatever the application code believes, in any deployment.
+      --
+      -- BOTH halves of the predicate, because each covers the other's weakness. A Shard charge is
+      -- permitted only on a row that is a Shard-era row (it carries the Shard price it was quoted
+      -- at) AND was created before the cutoff:
+      --
+      --   * price_shards alone is a marker column, and a marker can be written by the same bug
+      --     that writes the wrong charge.
+      --   * created_at alone depends on a literal instant, and the first draft of this constraint
+      --     picked midnight — which was seventy-one minutes in the FUTURE when the migration was
+      --     written, leaving the hole open for the rest of the evening. It was caught by a test
+      --     that expected a rejection and got none.
+      --
+      -- The cutoff is MEASURED, not assumed. The live estate holds three orders, all created at
+      -- 2026-08-04 06:31 UTC and NONE of them paid — so no row anywhere carries a Shard charge at
+      -- all, and 22:00 UTC is comfortably after every real row and comfortably in the past. That
+      -- matters beyond the INSERT: this is checked on UPDATE too, so a cutoff placed before a live
+      -- row would make that row unwritable for ever.
+      --
+      -- The literal carries an explicit offset so it does not depend on the session's TimeZone.
+      --
+      -- micro-ledger enforces the other half: its migration 13 refuses a posting of kind
+      -- 'purchase' denominated in a retired asset, from any caller. Both are needed. That one
+      -- cannot see this table, and this one cannot bind the other eleven services.
+      alter table tokens
+        drop constraint if exists tokens_no_new_shard_charge;
+      alter table tokens
+        add constraint tokens_no_new_shard_charge check (
+          charge_asset_code is distinct from 'SHARD'
+          or (price_shards is not null and created_at < timestamptz '2026-08-04 22:00:00+00')
+        );
+
+      -- Every order states a price in one of the two units. NOT a NOT NULL on price_usd_cents:
+      -- the migrator runs BEFORE the new code starts, so for the length of a rollout the old build
+      -- is still inserting rows that name price_shards and nothing else. A NOT NULL here would
+      -- turn that window into a 500 on every launch; this accepts both eras and still refuses a
+      -- row with no price at all.
+      alter table tokens
+        drop constraint if exists tokens_priced;
+      alter table tokens
+        add constraint tokens_priced check (
+          price_usd_cents is not null or price_shards is not null
+        );
+
+      -- A paid order records what was TAKEN, not only what was quoted. Without this the refund
+      -- path has nothing to return and the two-column design is decorative.
+      alter table tokens
+        drop constraint if exists tokens_paid_records_charge;
+      alter table tokens
+        add constraint tokens_paid_records_charge check (
+          paid_journal_entry_id is null
+          or (charge_asset_code is not null and charge_amount is not null)
+        );
+
+      -- A converted charge records the rate that produced it. A legacy Shard charge had no
+      -- conversion, so it has no rate to record and must not invent one.
+      alter table tokens
+        drop constraint if exists tokens_converted_charge_records_rate;
+      alter table tokens
+        add constraint tokens_converted_charge_records_rate check (
+          charge_asset_code is null
+          or charge_asset_code = 'SHARD'
+          or rate_usd_scaled is not null
+        );
+    `,
+  },
 ]
 
 /**

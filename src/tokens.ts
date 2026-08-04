@@ -90,7 +90,32 @@ export interface TokenRecord {
   readonly metadataUri: string | null
   readonly brandKitId: string | null
   readonly status: TokenStatus
-  readonly priceShards: bigint
+  /**
+   * What the customer was QUOTED, in US cents. The durable figure — see migration 6.
+   *
+   * Null only on an order created before migration 6 by a build that predates it. Every row the
+   * migration touched was back-filled, one Shard to one cent.
+   */
+  readonly priceUsdCents: bigint | null
+  /**
+   * What a pre-migration order was priced at, in Shards. **Historical only; nothing writes it.**
+   *
+   * Kept rather than dropped because it is what a past order ACTUALLY cost, and rewriting it would
+   * retroactively restate history. Null on everything created since.
+   */
+  readonly priceShards: bigint | null
+  /** What was actually charged — `EMBER` — and `SHARD` on a legacy paid order. Null until paid. */
+  readonly chargeAssetCode: string | null
+  /**
+   * The charge, in the settlement asset's smallest units. Wei, for EMBER.
+   *
+   * Stored beside `priceUsdCents` rather than derived from it, because a refund must return what
+   * was TAKEN. Recomputing $25.00 at today's administered rate would refund the wrong amount to
+   * anyone whose payment straddled a rate change.
+   */
+  readonly chargeAmount: bigint | null
+  /** The rate the conversion used, at `RATE_SCALE`. Null on a legacy 1:1 Shard charge. */
+  readonly rateUsdScaled: bigint | null
   readonly paidJournalEntryId: string | null
   readonly paidAt: Date | null
   readonly deployerAddress: string | null
@@ -126,7 +151,11 @@ interface TokenRow {
   readonly metadata_uri: string | null
   readonly brand_kit_id: string | null
   readonly status: string
-  readonly price_shards: string
+  readonly price_usd_cents: string | null
+  readonly price_shards: string | null
+  readonly charge_asset_code: string | null
+  readonly charge_amount: string | null
+  readonly rate_usd_scaled: string | null
   readonly paid_journal_entry_id: string | null
   readonly paid_at: Date | null
   readonly deployer_address: string | null
@@ -148,7 +177,8 @@ interface TokenRow {
 /** Every column, once. Repeating this list per query is how a projection quietly loses a field. */
 const COLUMNS = `
   id, owner_subject, owner_wallet_id, owner_address, chain, network, standard, name, symbol,
-  decimals, supply, cap, features, metadata_uri, brand_kit_id, status, price_shards,
+  decimals, supply, cap, features, metadata_uri, brand_kit_id, status,
+  price_usd_cents, price_shards, charge_asset_code, charge_amount, rate_usd_scaled,
   paid_journal_entry_id, paid_at, deployer_address, deploy_nonce, raw_tx, custody_audit_id,
   deploy_tx_hash, contract_address, broadcast_at, confirmed_at, failure_reason, lease_owner,
   lease_until, deploy_attempts, created_at, updated_at
@@ -175,7 +205,15 @@ export function toToken(row: TokenRow): TokenRecord {
     metadataUri: row.metadata_uri,
     brandKitId: row.brand_kit_id,
     status: row.status as TokenStatus,
-    priceShards: BigInt(row.price_shards),
+    // `BigInt('')` is `0n` and `BigInt(null as never)` is `0n` as well, so the null check is
+    // explicit rather than a `?? '0'` default. A price of zero is a free deploy — a gas bill the
+    // platform pays for anyone who can open an order — and it must never be something a missing
+    // column produces by accident.
+    priceUsdCents: row.price_usd_cents === null ? null : BigInt(row.price_usd_cents),
+    priceShards: row.price_shards === null ? null : BigInt(row.price_shards),
+    chargeAssetCode: row.charge_asset_code,
+    chargeAmount: row.charge_amount === null ? null : BigInt(row.charge_amount),
+    rateUsdScaled: row.rate_usd_scaled === null ? null : BigInt(row.rate_usd_scaled),
     paidJournalEntryId: row.paid_journal_entry_id,
     paidAt: row.paid_at,
     deployerAddress: row.deployer_address,
@@ -247,7 +285,8 @@ export interface CreateToken {
   readonly features: readonly Feature[]
   readonly metadataUri: string | null
   readonly brandKitId: string | null
-  readonly priceShards: bigint
+  /** What the order is quoted at, in US cents. `env.deployPriceUsdCents`. */
+  readonly priceUsdCents: bigint
   readonly actor: string
   readonly correlationId: string
 }
@@ -321,13 +360,13 @@ export async function createToken(
     const rows = await tx<TokenRow[]>`
       insert into tokens (
         owner_subject, owner_wallet_id, owner_address, chain, network, name, symbol, decimals,
-        supply, cap, features, metadata_uri, brand_kit_id, status, price_shards
+        supply, cap, features, metadata_uri, brand_kit_id, status, price_usd_cents
       ) values (
         ${input.ownerSubject}, ${input.ownerWalletId}, ${input.ownerAddress}, ${input.chain},
         ${input.network}, ${input.name}, ${input.symbol}, ${input.decimals},
         ${input.supply.toString()}::numeric, ${input.cap === null ? null : input.cap.toString()}::numeric,
         ${input.features as string[]}, ${input.metadataUri}, ${input.brandKitId},
-        'awaiting_payment', ${input.priceShards.toString()}::numeric
+        'awaiting_payment', ${input.priceUsdCents.toString()}::numeric
       )
       returning ${tx.unsafe(COLUMNS)}
     `
@@ -343,7 +382,7 @@ export async function createToken(
         chain: token.chain,
         network: token.network,
         symbol: token.symbol,
-        priceShards: token.priceShards.toString(),
+        priceUsdCents: token.priceUsdCents?.toString() ?? null,
       },
       actor: input.actor,
       correlationId: input.correlationId,
@@ -372,6 +411,11 @@ export async function markPaid(
     readonly id: string
     readonly ownerSubject: string
     readonly journalEntryId: string
+    /** The settlement asset, and what actually left the balance. Both, because a refund needs both. */
+    readonly chargeAssetCode: string
+    readonly chargeAmount: bigint
+    /** The rate that produced `chargeAmount`, at `RATE_SCALE`. Recorded so the sum is auditable. */
+    readonly rateUsdScaled: bigint
     readonly actor: string
     readonly correlationId: string
   },
@@ -380,6 +424,9 @@ export async function markPaid(
     update tokens
        set status = 'paid',
            paid_journal_entry_id = ${input.journalEntryId},
+           charge_asset_code = ${input.chargeAssetCode},
+           charge_amount = ${input.chargeAmount.toString()}::numeric,
+           rate_usd_scaled = ${input.rateUsdScaled.toString()}::numeric,
            paid_at = now(),
            updated_at = now()
      where id = ${input.id}
@@ -397,7 +444,9 @@ export async function markPaid(
       tokenId: token.id,
       ownerSubject: token.ownerSubject,
       journalEntryId: input.journalEntryId,
-      priceShards: token.priceShards.toString(),
+      priceUsdCents: token.priceUsdCents?.toString() ?? null,
+      chargeAssetCode: input.chargeAssetCode,
+      chargeAmount: input.chargeAmount.toString(),
     },
     actor: input.actor,
     correlationId: input.correlationId,

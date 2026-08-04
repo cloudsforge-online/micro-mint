@@ -90,7 +90,7 @@ try {
 //    and is covered by `servicetoken.test.ts` — it was untestable here, and what was untestable
 //    here was wrong for months. See that file. The per-chain RPC clients below are deliberately
 //    NOT given a token: they dial public chain nodes outside this estate.
-const { identityTokens, custody, indexer, ledger } = buildUpstreams(env, {
+const { identityTokens, custody, indexer, ledger, pricing } = buildUpstreams(env, {
   originatingService: SERVICE,
   onEvent: (event) => {
     if (event.kind === 'exchange_failed') {
@@ -199,6 +199,10 @@ lifecycle
   .addProbe(httpProbe('custody', `${env.custodyUrl}/livez`, { kind: 'soft' }))
   .addProbe(httpProbe('indexer', `${env.indexerUrl}/livez`, { kind: 'soft' }))
   .addProbe(httpProbe('ledger', `${env.ledgerUrl}/livez`, { kind: 'soft' }))
+  // Soft, like its neighbours: a rate board that is briefly unreachable stops payments, which is
+  // the fail-closed behaviour `pricingclient.ts` argues for, but it does not stop this replica
+  // serving the catalogue, the launch form or a deploy that is already paid for.
+  .addProbe(httpProbe('pricing', `${env.pricingUrl}/livez`, { kind: 'soft' }))
 
 // 7. The dependency bundles, built once and shared so the routes and the worker cannot disagree
 //    about which network they are on or which bounds they are enforcing.
@@ -243,10 +247,11 @@ const server = createServer({
   sql: db,
   producer: SERVICE,
   network: env.network,
-  pay: { sql: db, ledger, producer: SERVICE },
+  pay: { sql: db, ledger, pricing, settlementAsset: env.settlementAsset, producer: SERVICE },
   render: { sql: db, indexer },
   queue,
-  priceShards: env.deployPriceShards,
+  priceUsdCents: env.deployPriceUsdCents,
+  settlementAsset: env.settlementAsset,
   mainnetAllowlist: env.mainnetAllowlist,
   // Queue depth is sampled at scrape time rather than on a timer. There is no `setInterval` in
   // this repository, and CI greps for one — rule 8.

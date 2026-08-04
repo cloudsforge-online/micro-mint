@@ -54,6 +54,7 @@ import {
 import { httpCustodyClient, type CustodyClient } from './custodyclient.ts'
 import { httpIndexerClient, type IndexerClient } from './indexerclient.ts'
 import { httpLedgerClient, type LedgerClient } from './ledgerclient.ts'
+import { httpPricingClient, type PricingClient } from './pricingclient.ts'
 // TYPE-ONLY, and that matters. `./env.ts` validates the process environment at import and calls
 // `process.exit(1)` when it is incomplete, so a value import here would make this module — and
 // therefore every test of the wiring in it — impossible to load without a full environment. That
@@ -70,6 +71,12 @@ export interface Upstreams {
   readonly custody: CustodyClient
   readonly indexer: IndexerClient
   readonly ledger: LedgerClient
+  /**
+   * The USD→EMBER rate board. **Unauthenticated**, unlike the three above: the rate board is public
+   * in this estate by design (`pricing/src/server.ts:9`), so this client presents no credential and
+   * needs no service-token grant. Wiring it to `token` would demand a scope nobody issues.
+   */
+  readonly pricing: PricingClient
 }
 
 export interface UpstreamOptions {
@@ -88,6 +95,7 @@ export type UpstreamEnv = Pick<
   | 'custodyUrl'
   | 'indexerUrl'
   | 'ledgerUrl'
+  | 'pricingUrl'
   | 'upstreamDeadlineMs'
 >
 
@@ -130,6 +138,12 @@ export function buildUpstreams(env: UpstreamEnv, options: UpstreamOptions): Upst
       baseUrl: env.ledgerUrl,
       originatingService: options.originatingService,
       ...common,
+    }),
+    // No `...common`: no token, deliberately. See the field comment.
+    pricing: httpPricingClient({
+      baseUrl: env.pricingUrl,
+      deadlineMs: env.upstreamDeadlineMs,
+      ...(options.fetch ? { fetch: options.fetch } : {}),
     }),
   }
 }

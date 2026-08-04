@@ -61,6 +61,7 @@ jobs:
         CUSTODY_URL=http://127.0.0.1:4005
         INDEXER_URL=http://127.0.0.1:4008
         LEDGER_URL=http://127.0.0.1:4007
+        PRICING_URL=http://127.0.0.1:4009
         MINT_SERVICE_TOKEN=ci-only-not-a-real-token-0000000000000
     secrets:
       # @cloudsforge/* resolves through link:../runtime and link:../contracts rather than a

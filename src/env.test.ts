@@ -25,6 +25,7 @@ const BASE: Record<string, string> = {
   CUSTODY_URL: 'http://127.0.0.1:4005',
   INDEXER_URL: 'http://127.0.0.1:4008',
   LEDGER_URL: 'http://127.0.0.1:4007',
+  PRICING_URL: 'http://127.0.0.1:4009',
 }
 for (const [key, value] of Object.entries(BASE)) process.env[key] = value
 
@@ -101,7 +102,29 @@ test('a gas floor above the ceiling is refused rather than silently reordered', 
 })
 
 test('a zero deploy price is refused: a free deploy is a free gas bill', () => {
-  assert.throws(() => loadEnv({ ...BASE, MINT_DEPLOY_PRICE_SHARDS: '0' }, 'host'), /positive/)
+  assert.throws(() => loadEnv({ ...BASE, MINT_DEPLOY_PRICE_USD_CENTS: '0' }, 'host'), /positive/)
+})
+
+test('the retired price variable is refused outright, never accepted and ignored', () => {
+  // A deployment that still sets MINT_DEPLOY_PRICE_SHARDS is stating a price in a unit the estate
+  // stopped issuing on 2026-08-04. Ignoring it and charging the default instead would leave an
+  // operator believing a number that is not the one being charged — the same class of mistake as
+  // the one this release fixes. It fails at boot, where somebody is looking.
+  assert.throws(
+    () => loadEnv({ ...BASE, MINT_DEPLOY_PRICE_SHARDS: '2500' }, 'host'),
+    /MINT_DEPLOY_PRICE_USD_CENTS/,
+  )
+})
+
+test('the default price is unchanged in value: 2,500 Shards was 2,500 cents', () => {
+  // One Shard is exactly one cent — SHARD has decimals 0, USD is cents, the peg is 100 Shards to
+  // the dollar. This asserts the re-denomination moved no number, which is the whole safety
+  // argument of migration 6.
+  assert.equal(loadEnv(BASE, 'host').deployPriceUsdCents, 2_500n)
+})
+
+test('the settlement asset cannot be a retired one, and is not configurable', () => {
+  assert.equal(loadEnv({ ...BASE, MINT_SETTLEMENT_ASSET: 'SHARD' }, 'host').settlementAsset, 'EMBER')
 })
 
 test('an unparseable RPC map is refused rather than defaulted to empty', () => {

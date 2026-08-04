@@ -163,7 +163,7 @@ export function constructorArgs(spec: VariantSpec, input: ConstructorInput): rea
  * (`deploy.ts:118-169`), released the lease and rethrew, and `outstandingDeploys` — which selects
  * on `CLAIMABLE`, and `deploying` is in it (`tokens.ts:68-73`) — swept the row back onto the queue
  * on the next tick. Not a terminal failure with a reason on the row: a permanent loop, with the
- * customer's Shards spent and the order never reaching any state a human is shown.
+ * customer's money spent and the order never reaching any state a human is shown.
  *
  * ## Why it is not a second copy of the rule
  *

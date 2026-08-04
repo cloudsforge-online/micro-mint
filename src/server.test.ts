@@ -22,6 +22,7 @@ import {
   enabled,
   fakeIndexer,
   fakeLedger,
+  fakePricing,
   migrateTestDb,
   openDb,
   resetMint,
@@ -88,7 +89,7 @@ before(async () => {
     sql: db,
     producer: 'mint',
     network: 'testnet',
-    pay: { sql: db, ledger, producer: 'mint' },
+    pay: { sql: db, ledger, pricing: fakePricing(), settlementAsset: 'EMBER', producer: 'mint' },
     render: { sql: db, indexer },
     queue: {
       async enqueue(options) {
@@ -99,7 +100,8 @@ before(async () => {
         })
       },
     },
-    priceShards: 2_500n,
+    priceUsdCents: 2_500n,
+    settlementAsset: 'EMBER',
     // One allowlisted subject, so both halves of the gate are exercised.
     mainnetAllowlist: [`user:${ALICE}`],
   })
@@ -194,7 +196,13 @@ test('an order is created without charging or deploying anything', { skip }, asy
   assert.equal(res.status, 201)
   const token = res.body['token'] as Record<string, unknown>
   assert.equal(token['status'], 'awaiting_payment')
-  assert.equal(token['priceShards'], '2500')
+  // US cents on the wire, and `priceShards` gone rather than renamed — a removed field is an
+  // `undefined` a stale client can notice, a re-based one is not.
+  assert.equal(token['priceUsdCents'], '2500')
+  assert.equal(token['priceShards'], undefined)
+  // Nothing has been charged, so there is no charge to report yet.
+  assert.equal(token['chargeAssetCode'], null)
+  assert.equal(token['chargeAmount'], null)
   // Strings on the wire. A supply of 10^24 does not survive a JSON number.
   assert.equal(token['supply'], ORDER.supply)
   assert.equal(ledger.entries.length, 0)
@@ -507,4 +515,43 @@ test('an unmatched path collapses to one metric label', { skip }, async () => {
   const metrics = await (await fetch(`${baseUrl}/metrics`)).text()
   assert.match(metrics, /route="unmatched"/)
   assert.doesNotMatch(metrics, /route="\/v1\/nope\/12345"/)
+})
+
+/* ═════════════════════════════ the wire, after migration 6 ═════════════════════════════ */
+
+test('the catalogue quotes US cents and names what it settles in', { skip }, async () => {
+  const res = await call('/v1/catalogue', {})
+  assert.equal(res.status, 200)
+  assert.equal(res.body['priceUsdCents'], '2500')
+  // Published rather than assumed by the client. A surface that had to guess would guess wrong the
+  // day it changes, and guessing wrong about a unit is how a screen ends up printing a price in a
+  // currency the ledger does not record.
+  assert.equal(res.body['settlementAsset'], 'EMBER')
+  // Removed, not renamed. A stale client reading `priceShards` gets `undefined` — something it can
+  // notice — rather than a number silently re-based into a different unit.
+  assert.equal(res.body['priceShards'], undefined)
+})
+
+test('a paid order reports what was quoted AND what was taken', { skip }, async () => {
+  const created = await call('/v1/tokens', { method: 'POST', token: 'alice', body: ORDER })
+  const id = (created.body['token'] as Record<string, unknown>)['id'] as string
+
+  const paid = await call(`/v1/tokens/${id}/pay`, { method: 'POST', token: 'alice' })
+  // 201 on a fresh debit, 200 on a replay — see the route.
+  assert.equal(paid.status, 201)
+  const token = paid.body['token'] as Record<string, unknown>
+
+  assert.equal(token['priceUsdCents'], '2500')
+  assert.equal(token['chargeAssetCode'], 'EMBER')
+  // $25.00 at the fixture rate of $0.25/EMBER is 100 EMBER, in wei. A decimal STRING: 1e20 does not
+  // survive a JSON number.
+  assert.equal(token['chargeAmount'], '100000000000000000000')
+  // A Spark is 10^-6 EMBER — a DISPLAY denomination of one asset, never a second asset code — so
+  // WEI_PER_SPARK is 10^12 and 100 EMBER is 10^8 Sparks. Written out rather than computed from the
+  // line above, because a test that divides by the same constant the code divides by would agree
+  // with a wrong constant.
+  assert.equal(token['chargeAmountSparks'], '100000000')
+  // The rate, so the two amounts above can be checked against each other afterwards.
+  assert.equal(token['rateUsdScaled'], '250000')
+  assert.equal(token['priceShards'], undefined)
 })

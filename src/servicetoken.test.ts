@@ -140,6 +140,7 @@ function upstreamsFor(w: World, options: { credential: string | null; onMinted?:
     custodyUrl: 'http://custody:4000',
     indexerUrl: PEER,
     ledgerUrl: 'http://ledger:4000',
+    pricingUrl: 'http://pricing:4000',
     upstreamDeadlineMs: 5_000,
   }
   return buildUpstreams(env, {

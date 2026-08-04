@@ -43,7 +43,7 @@ import {
   subjectUserId,
   type Principal,
 } from '@cloudsforge/auth'
-import type { Network } from '@cloudsforge/contracts-chain'
+import type { IssuableAssetCode, Network } from '@cloudsforge/contracts-chain'
 import { userSubject } from '@cloudsforge/contracts-money'
 import type { Lifecycle } from '@cloudsforge/lifecycle'
 import { Metrics, newRequestId, type Logger } from '@cloudsforge/telemetry'
@@ -58,6 +58,7 @@ import {
   type Feature,
 } from './catalogue.ts'
 import { InsufficientBalanceError, OrderStateError, payForDeploy, type PayDeps } from './orders.ts'
+import { sparksForDisplay } from './pricingclient.ts'
 import { renderProjectPage, upsertProjectPage, type RenderDeps } from './projectpages.ts'
 import { DEPLOY_KIND } from './jobs.ts'
 import {
@@ -90,7 +91,10 @@ export interface ServerDeps {
   readonly pay: PayDeps
   readonly render: RenderDeps
   readonly queue: Pick<JobQueue, 'enqueue'>
-  readonly priceShards: bigint
+  /** What a deploy is quoted at, in US cents. Settled in EMBER at payment — see `orders.ts`. */
+  readonly priceUsdCents: bigint
+  /** What a deploy is charged in. Published so a client never has to assume it. */
+  readonly settlementAsset: IssuableAssetCode
   /**
    * Subjects permitted to deploy to a mainnet. Empty means nobody, and empty is the default.
    * The frozen service gates mainnet on nothing at all, so any authenticated caller with a paid
@@ -354,7 +358,14 @@ function buildRoutes(): Route[] {
     define('GET', '/v1/catalogue', async (_ctx, deps) => ({
       status: 200,
       body: {
-        priceShards: deps.priceShards.toString(),
+        // A decimal STRING, like every amount this service serves. `priceShards` is gone rather
+        // than renamed in place: SHARD was retired on 2026-08-04, this field carried a real Shard
+        // figure until migration 6, and a client that kept reading the old name would have been
+        // reading cents as Shards — a price wrong by a factor of nothing, but labelled in a unit
+        // the estate no longer issues. A removed field is a 'undefined' a client can notice; a
+        // silently re-based one is not.
+        priceUsdCents: deps.priceUsdCents.toString(),
+        settlementAsset: deps.settlementAsset,
         network: deps.network,
         variants: (['fixed', 'mintable', 'foundry'] as const).map((variant) => {
           const spec = variantFor(
@@ -427,7 +438,7 @@ function buildRoutes(): Route[] {
           features,
           metadataUri: stringOrUndefined(body['metadataUri']) ?? null,
           brandKitId: stringOrUndefined(body['brandKitId']) ?? null,
-          priceShards: deps.priceShards,
+          priceUsdCents: deps.priceUsdCents,
           actor: actorOf(principal),
           correlationId: ctx.requestId,
         })
@@ -654,7 +665,22 @@ function toWire(token: TokenRecord): Record<string, unknown> {
     cap: token.cap === null ? null : token.cap.toString(),
     features: token.features,
     status: token.status,
-    priceShards: token.priceShards.toString(),
+    // What the customer was QUOTED. Null only on a row a pre-migration-6 build wrote.
+    priceUsdCents: token.priceUsdCents?.toString() ?? null,
+    // What was actually TAKEN, and in what. Both, because a refund must return the second and a
+    // receipt must state the first. `chargeAssetCode` is 'SHARD' on an order paid before the
+    // migration, and that is the truth about it — the alternative is printing EMBER over a charge
+    // the ledger records as SHARD, which is a false statement about money.
+    chargeAssetCode: token.chargeAssetCode,
+    chargeAmount: token.chargeAmount?.toString() ?? null,
+    // A display denomination of EMBER, never a second asset code. Null when the charge is not a
+    // whole number of Sparks: rounding it would print a price that is not the price.
+    chargeAmountSparks:
+      token.chargeAssetCode === 'EMBER' && token.chargeAmount !== null
+        ? sparksForDisplay(token.chargeAmount)
+        : null,
+    /** The rate the conversion used, at `RATE_SCALE`, so the two amounts above can be checked. */
+    rateUsdScaled: token.rateUsdScaled?.toString() ?? null,
     paidJournalEntryId: token.paidJournalEntryId,
     deployerAddress: token.deployerAddress,
     contractAddress: token.contractAddress,

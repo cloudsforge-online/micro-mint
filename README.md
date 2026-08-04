@@ -228,6 +228,7 @@ token whenever one is needed. Setting the old variable is logged as ignored at b
 | `CUSTODY_URL` | — | **required**. No signature, no deploy (`src/env.ts:264`) |
 | `INDEXER_URL` | — | **required** (`src/env.ts:265`) |
 | `LEDGER_URL` | — | **required**. No debit, no order (`src/env.ts:266`) |
+| `PRICING_URL` | — | **required**. The USD→EMBER rate board. No rate, no payment — fail closed rather than guess how much of a customer's money to take (`src/pricingclient.ts`) |
 | `MINT_IDENTITY_CREDENTIAL` | — | **≥24 chars, `cfsc_…`.** The long-lived credential exchanged at `POST /service-tokens/exchange` for a ten-minute token — **not shared**, SD-05. Technically optional so the image can boot for CI's `/livez` smoke test, but `/readyz` fails hard without it and every peer call 503s |
 | `IDENTITY_URL` | `IDENTITY_ISSUER` | where the credential is exchanged. Only set it where the issuer and the dialled address genuinely differ |
 | `MINT_SERVICE_TOKEN` | — | **retired.** A 600-second token read once at boot. If still set, boot logs that it is ignored |
@@ -241,7 +242,7 @@ token whenever one is needed. Setting the old variable is logged as ignored at b
 | `MINT_MAX_GAS_PRICE_WEI` | `500000000000` | must be ≥ the minimum, or boot fails (`src/env.ts:238-241`) |
 | `MINT_MAX_FEE_WEI` | `1e18` | the most one deploy may cost in gas. Custody enforces its own ceiling at 2e18 (`src/env.ts:279`, `:206`) |
 | `MINT_STUCK_MINUTES` | `30` | how long a deploy may sit unconfirmed before it is called stuck. **Above one confirmation window on every chain the estate deploys to, so a slow block is not an incident.** The frozen service had 180 *seconds*, and it was a request timeout rather than a stuck deadline (`src/env.ts:283`, reasoning at `:280-282`) |
-| `MINT_DEPLOY_PRICE_SHARDS` | `2500` | **must be positive.** A zero price is a free deploy, which is a free gas bill paid by the platform for anyone who can open an order — refused rather than defaulted back, because the value was stated (`src/env.ts:243-248`) |
+| `MINT_DEPLOY_PRICE_USD_CENTS` | `2500` | **must be positive.** A zero price is a free deploy, which is a free gas bill paid by the platform for anyone who can open an order — refused rather than defaulted back, because the value was stated. Replaces `MINT_DEPLOY_PRICE_SHARDS`, which is now **refused at boot**: one Shard was exactly one cent, so the same number is the same price, but a deployment that still names the retired unit is stating a price in something the estate no longer issues and must be told rather than silently corrected (`src/env.ts`) |
 
 ---
 

@@ -32,11 +32,12 @@ import { createHash } from 'node:crypto'
 import postgres from 'postgres'
 import { migrate, type Sql as DbSql } from '@cloudsforge/db'
 import { Logger, Metrics } from '@cloudsforge/telemetry'
-import type { Network } from '@cloudsforge/contracts-chain'
+import { chainSpec, coinAmountForUsdCents, type Network } from '@cloudsforge/contracts-chain'
 import { MIGRATIONS, TABLES } from './migrations.ts'
 import { registerServiceMetrics } from './server.ts'
 import { evmTxHash, toChecksumAddress, type FeeBounds, type JsonRpc } from './evm.ts'
 import type { ChainId } from './chains.ts'
+import type { PricingClient } from './pricingclient.ts'
 import type { CustodyClient, DeployerAddress, SignRequest, SignedResult } from './custodyclient.ts'
 import type { IndexedToken, IndexedTransaction, IndexerClient } from './indexerclient.ts'
 import type { LedgerClient, PostEntryRequest, PostedEntry } from './ledgerclient.ts'
@@ -350,6 +351,63 @@ export function fakeIndexer(): FakeIndexer {
   }
 }
 
+/* ------------------------------------------------------------------ pricing */
+
+/**
+ * The rate at which the fixtures below convert: **$0.25 to one EMBER**, at `RATE_SCALE`.
+ *
+ * `RATE_SCALE` is 1,000,000 (`contracts/packages/chain/src/index.ts:358`), so $0.25 is 250,000 and
+ * NOT 250,000,000. That distinction is written down because this file had the second number for one
+ * draft, and the only symptom was a charge a thousand times too small — no type error, no
+ * exception, a perfectly balanced entry for the wrong amount of money. Reading the scale rather
+ * than assuming it is the whole reason `pricingclient.ts` checks the published `rateScale` instead
+ * of trusting it.
+ *
+ * The value is the administered figure `micro-pricing` is actually seeded with
+ * (`pricing/src/migrations.ts:185`), so these tests convert at the number the live rate board
+ * carries rather than a round one chosen to make the arithmetic easy. At this rate $25.00 — 2,500
+ * cents, the default deploy price — settles to exactly 100 EMBER.
+ */
+export const FAKE_RATE_USD_SCALED = 250_000n
+
+export interface FakePricing extends PricingClient {
+  /** Every asset it was asked about, in order. */
+  readonly asked: readonly string[]
+  /** Make the next quote fail, the way an unreachable or unusable rate board does. */
+  failNext(err: Error): void
+}
+
+/**
+ * A rate board that always answers, until told not to.
+ *
+ * It computes with `coinAmountForUsdCents` rather than returning a canned number: the conversion
+ * is the thing under test at every call site, and a fake that returned a constant would let a
+ * decimals mistake through — which is the one mistake in this area that costs eighteen orders of
+ * magnitude.
+ */
+export function fakePricing(): FakePricing {
+  const asked: string[] = []
+  let failure: Error | null = null
+  return {
+    asked,
+    failNext(err) {
+      failure = err
+    },
+    async quote(asset, cents) {
+      asked.push(asset)
+      if (failure) {
+        const err = failure
+        failure = null
+        throw err
+      }
+      return {
+        usdScaled: FAKE_RATE_USD_SCALED,
+        amount: coinAmountForUsdCents(cents, chainSpec(asset).decimals, FAKE_RATE_USD_SCALED),
+      }
+    },
+  }
+}
+
 /* ------------------------------------------------------------------ ledger */
 
 export interface FakeLedger extends LedgerClient {
@@ -438,6 +496,22 @@ export const skip = enabled ? false : 'set MINT_TEST_DATABASE_URL (name must con
 export function openDb(max = 8): postgres.Sql {
   if (!enabled) throw new Error('database tests are disabled')
   return postgres(url!, { max, onnotice: () => {} })
+}
+
+/**
+ * The configured URL, for the one case that needs a DIFFERENT database on the same server.
+ *
+ * `migrations.test.ts` replays the real upgrade path — bring a schema to version 5, write the row a
+ * pre-migration build wrote, then migrate — and it cannot do that on the suite's own database
+ * without deleting an applied-version row and dropping constraints, which leaves every later case
+ * in the file red if it fails halfway. It derives a sibling name from this.
+ *
+ * The `test` requirement above still binds: a sibling of `mint_test` is named `mint_backfill_test`
+ * and nothing outside this suite is reachable.
+ */
+export function testDatabaseUrl(): string {
+  if (!enabled) throw new Error('database tests are disabled')
+  return url!
 }
 
 /**
@@ -542,7 +616,14 @@ export async function seedToken(
     cap: null as string | null,
     features: [] as string[],
     status: 'paid',
-    price_shards: '2500',
+    // USD cents, and the charge that settled it. 2,500 cents is $25.00, which is what 2,500 Shards
+    // was — one Shard is exactly one cent, so migration 6 moved no number. `price_shards` is
+    // absent from this seed on purpose: nothing writes it any more, and a fixture that kept
+    // setting it would keep the retired era alive in every test that touches a token.
+    price_usd_cents: '2500',
+    charge_asset_code: 'EMBER',
+    charge_amount: '100000000000000000000',
+    rate_usd_scaled: '250000',
     paid_journal_entry_id: 'entry-1',
     // The terminal columns. Present here because `tokens_terminal_is_complete` refuses a
     // `deployed` row with no address and a `failed` row with no reason — a seed helper that could
@@ -557,12 +638,15 @@ export async function seedToken(
   const rows = await sql<{ id: string }[]>`
     insert into tokens (
       owner_subject, owner_wallet_id, owner_address, chain, network, name, symbol, decimals,
-      supply, cap, features, status, price_shards, paid_journal_entry_id, paid_at,
+      supply, cap, features, status, price_usd_cents, charge_asset_code, charge_amount,
+      rate_usd_scaled, paid_journal_entry_id, paid_at,
       deploy_tx_hash, contract_address, broadcast_at, failure_reason
     ) values (
       ${row.owner_subject}, ${row.owner_wallet_id}, ${row.owner_address}, ${row.chain},
       ${row.network}, ${row.name}, ${row.symbol}, ${row.decimals}, ${row.supply}::numeric,
-      ${row.cap}::numeric, ${row.features}, ${row.status}, ${row.price_shards}::numeric,
+      ${row.cap}::numeric, ${row.features}, ${row.status}, ${row.price_usd_cents}::numeric,
+      ${row.charge_asset_code as string | null}, ${row.charge_amount as string | null}::numeric,
+      ${row.rate_usd_scaled as string | null}::numeric,
       ${row.paid_journal_entry_id}, now(),
       ${row.deploy_tx_hash as string | null}, ${row.contract_address as string | null},
       ${row.broadcast_at as string | null}::timestamptz, ${row.failure_reason as string | null}

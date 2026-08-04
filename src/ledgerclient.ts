@@ -21,6 +21,7 @@
 
 import { HttpClient, HttpError } from '@cloudsforge/http'
 import type { Actor, EntryKind, LedgerAssetCode } from '@cloudsforge/contracts-money'
+import type { IssuableAssetCode } from '@cloudsforge/contracts-chain'
 import type { LiveScope } from '@cloudsforge/contracts-auth'
 
 /**
@@ -94,28 +95,43 @@ export interface LedgerClient {
 }
 
 /**
- * The two postings that pay for a deploy: the customer's Shards out, the platform's revenue in.
+ * The two postings that pay for a deploy: the customer's EMBER out, the platform's revenue in.
  *
  * Balanced by construction because it is the same number on both sides, which is what lets the
  * ledger refuse an unbalanced entry without this service having to prove anything.
+ *
+ * ══════════════════════════════════════════════════════════════════════════════════════════════
+ * **`assetCode` IS A PARAMETER, AND IT IS TYPED `IssuableAssetCode`.**
+ *
+ * It used to be the literal `'SHARD'`, four times over, and that is the whole defect this release
+ * fixes: SHARD was retired on 2026-08-04 and this function went on debiting it, so a customer of
+ * Forge Create was charged in a wound-down unit for a day. The screen that said "Pay 2,500 Shards"
+ * was reporting this function accurately.
+ *
+ * `IssuableAssetCode` is `Exclude<AssetCode, 'SHARD'>` (contracts/packages/chain). Passing a
+ * retired code here is now a COMPILE ERROR rather than a comment somebody has to read, which is
+ * the only kind of rule that survives the next edit. micro-ledger refuses it a second time at the
+ * database — its migration 13 — because a compile error binds this repository and nothing else.
+ * ══════════════════════════════════════════════════════════════════════════════════════════════
  */
 export function deployPostings(input: {
   readonly subject: string
+  readonly assetCode: IssuableAssetCode
   readonly amount: bigint
 }): readonly PostingRequest[] {
   return [
     {
-      account: { subject: input.subject, assetCode: 'SHARD', purpose: 'available', type: 'liability' },
+      account: { subject: input.subject, assetCode: input.assetCode, purpose: 'available', type: 'liability' },
       direction: 'debit',
       amount: input.amount,
-      assetCode: 'SHARD',
+      assetCode: input.assetCode,
       sequence: 0,
     },
     {
-      account: { subject: 'platform', assetCode: 'SHARD', purpose: 'fees', type: 'revenue' },
+      account: { subject: 'platform', assetCode: input.assetCode, purpose: 'fees', type: 'revenue' },
       direction: 'credit',
       amount: input.amount,
-      assetCode: 'SHARD',
+      assetCode: input.assetCode,
       sequence: 1,
     },
   ]

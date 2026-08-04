@@ -25,7 +25,7 @@
  */
 
 import { hostname } from 'node:os'
-import type { Network } from '@cloudsforge/contracts-chain'
+import type { IssuableAssetCode, Network } from '@cloudsforge/contracts-chain'
 
 /**
  * The service's own name. A constant rather than a variable: it is a property of the repository,
@@ -192,6 +192,15 @@ export interface Env {
   readonly custodyUrl: string
   readonly indexerUrl: string
   readonly ledgerUrl: string
+  /**
+   * Where micro-pricing is, for `GET /rates/:asset`.
+   *
+   * A new upstream, and a real availability coupling: a deploy cannot be paid for while the rate
+   * is unreadable. That is the fail-closed choice `pricingclient.ts` argues — you cannot charge
+   * somebody in a currency you cannot price, and the only alternative to refusing is guessing how
+   * much of their money to take.
+   */
+  readonly pricingUrl: string
 
   /**
    * Where identity is, for `POST /service-tokens/exchange`.
@@ -264,8 +273,24 @@ export interface Env {
   readonly maxFeeWei: bigint
   /** How long a deploy may sit unconfirmed before it is called stuck and an operator is told. */
   readonly stuckMinutes: number
-  /** The price of one token deploy, in Shards. Debited from the customer at `POST /pay`. */
-  readonly deployPriceShards: bigint
+  /**
+   * The price of one token deploy, in **US cents**. Quoted at `POST /tokens`, settled at
+   * `POST /pay`.
+   *
+   * It was `deployPriceShards` and the default was 2,500 Shards. One Shard is exactly one cent
+   * (SHARD has decimals 0, USD is cents, the peg is 100 Shards to the dollar), so 2,500 cents is
+   * the same $25.00 and the re-denomination moved no number. See migration 6.
+   */
+  readonly deployPriceUsdCents: bigint
+
+  /**
+   * What a customer is actually charged in.
+   *
+   * Typed `IssuableAssetCode` — `Exclude<AssetCode, 'SHARD'>` — and not a string. A build that
+   * tried to route this back through Shards would not compile, which is the difference between a
+   * rule and a comment, and it is the check this service did not have on 2026-08-04.
+   */
+  readonly settlementAsset: IssuableAssetCode
 }
 
 const LEVELS = new Set(['debug', 'info', 'warn', 'error'])
@@ -297,11 +322,22 @@ export function loadEnv(source: Source = process.env, host = ''): Env {
     throw new EnvError('MINT_MIN_GAS_PRICE_WEI exceeds MINT_MAX_GAS_PRICE_WEI')
   }
 
-  const deployPriceShards = wei(source, 'MINT_DEPLOY_PRICE_SHARDS', 2_500n)
-  if (deployPriceShards <= 0n) {
+  // MINT_DEPLOY_PRICE_SHARDS is gone rather than accepted-and-ignored. A deployment that still
+  // sets it is stating a price in a retired unit, and silently pricing in something else would be
+  // the same class of mistake as the one this release exists to fix — the operator would believe a
+  // number that is not the one being charged.
+  if ((source['MINT_DEPLOY_PRICE_SHARDS'] ?? '').trim().length > 0) {
+    throw new EnvError(
+      'MINT_DEPLOY_PRICE_SHARDS is retired with the asset it names. Set ' +
+        'MINT_DEPLOY_PRICE_USD_CENTS instead — one Shard was exactly one cent, so the same ' +
+        'number is the same price.',
+    )
+  }
+  const deployPriceUsdCents = wei(source, 'MINT_DEPLOY_PRICE_USD_CENTS', 2_500n)
+  if (deployPriceUsdCents <= 0n) {
     // A zero price is a free deploy, which is a free gas bill paid by the platform for anyone who
     // can open an order. Refused rather than defaulted back, because the value was stated.
-    throw new EnvError('MINT_DEPLOY_PRICE_SHARDS must be positive')
+    throw new EnvError('MINT_DEPLOY_PRICE_USD_CENTS must be positive')
   }
 
   return {
@@ -321,6 +357,7 @@ export function loadEnv(source: Source = process.env, host = ''): Env {
     custodyUrl: required(source, 'CUSTODY_URL'),
     indexerUrl: required(source, 'INDEXER_URL'),
     ledgerUrl: required(source, 'LEDGER_URL'),
+    pricingUrl: required(source, 'PRICING_URL'),
     identityUrl: optional(source, 'IDENTITY_URL', required(source, 'IDENTITY_ISSUER')),
     // Not `requiredSecret`: see the field comment. The absence is caught by `/readyz`, which is
     // a check that can fail, rather than by a boot CI cannot perform.
@@ -342,7 +379,11 @@ export function loadEnv(source: Source = process.env, host = ''): Env {
     // an incident. The frozen service had 180 SECONDS, and it was a request timeout rather than a
     // stuck deadline — see the header of `deploy.ts`.
     stuckMinutes: integer(source, 'MINT_STUCK_MINUTES', 30, 1, 1_440),
-    deployPriceShards,
+    deployPriceUsdCents,
+    // Not read from the environment. EMBER is the estate's settlement asset and the only chain-
+    // backed unit a customer holds; making it configurable would be offering an operator a way to
+    // put a retired code back, which is exactly what the type forbids.
+    settlementAsset: 'EMBER',
   }
 }
 
