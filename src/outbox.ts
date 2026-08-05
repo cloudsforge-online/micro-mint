@@ -136,9 +136,20 @@ export function signEvent(body: string, secret: string): string {
   return signDelivery(body, secret)
 }
 
-/** Timing-safety and the freshness window both live in the contract's verifier. */
-export function verifyEventSignature(body: string, secret: string, presented: string): boolean {
-  return verifyDelivery(body, presented, secret).ok
+/**
+ * Timing-safety and the freshness window both live in the contract's verifier.
+ *
+ * A LIST of secrets is accepted, not only one, because the estate's shared signing key has to be
+ * rotatable one service at a time. With a single accepted secret every service has to change key in
+ * the same instant or drop events in the gap, which is a flag day nobody schedules — so the key is
+ * never rotated at all. The contract's verifier tries each in turn, timing-safely.
+ */
+export function verifyEventSignature(
+  body: string,
+  secrets: string | readonly string[],
+  presented: string,
+): boolean {
+  return verifyDelivery(body, presented, secrets).ok
 }
 
 /* ------------------------------------------------------------------------ relay */
@@ -408,6 +419,14 @@ async function deliver(
     return false
   }
 }
+
+/**
+ * Re-exported so the inbound webhook names the SAME header constant the relay signs under.
+ *
+ * A second copy of the literal in `server.ts` is how a consumer ends up verifying a header nobody
+ * sends — which is exactly the failure this file's header describes, once already.
+ */
+export { EVENT_ID_HEADER, SIGNATURE_HEADER }
 
 /* ------------------------------------------------------------------------ inbox */
 

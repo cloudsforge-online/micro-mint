@@ -253,6 +253,11 @@ const server = createServer({
   priceUsdCents: env.deployPriceUsdCents,
   settlementAsset: env.settlementAsset,
   mainnetAllowlist: env.mainnetAllowlist,
+  // The estate signs every event with one shared key, so what this service SIGNS with is also what
+  // it ACCEPTS. A list of one, because the field is a list: the day that key is rotated, a second
+  // entry lets this service accept both while the producers move over, and no event is dropped in
+  // the gap.
+  eventAcceptSecrets: [env.outboxSigningSecret],
   // Queue depth is sampled at scrape time rather than on a timer. There is no `setInterval` in
   // this repository, and CI greps for one — rule 8.
   beforeScrape: async () => {

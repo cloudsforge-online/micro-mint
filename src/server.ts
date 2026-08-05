@@ -70,7 +70,8 @@ import {
   createToken,
   type TokenRecord,
 } from './tokens.ts'
-import type { Db } from './outbox.ts'
+import { SIGNATURE_HEADER, verifyEventSignature, withInbox, type Db } from './outbox.ts'
+import { eraseUser } from './erasure.ts'
 
 /** The verifier as this file needs it. An interface, so a test does not need a JWKS. */
 export interface PrincipalVerifier {
@@ -101,8 +102,23 @@ export interface ServerDeps {
    * order can put a contract on Ethereum mainnet at the platform's expense.
    */
   readonly mainnetAllowlist: readonly string[]
+  /**
+   * The secrets `POST /v1/events` will ACCEPT, newest first.
+   *
+   * A list rather than one, so the estate's shared event-signing key can be rotated one service at
+   * a time. Wired from `[env.outboxSigningSecret]` in `index.ts` — the same value every producer
+   * signs with today — so shipping this changes no deployment.
+   */
+  readonly eventAcceptSecrets: readonly string[]
   readonly beforeScrape?: () => Promise<void>
 }
+
+/**
+ * What this service consumes. Rule 6 of docs/ecosystem/03 §2: every service that stores a
+ * `user_id` subscribes to `identity.user.deleted` and erases. This one stores `owner_subject`,
+ * which is a user id in the ledger's spelling — see `erasure.ts` for what it then does.
+ */
+const SUBSCRIBED_TOPICS = new Set(['identity.user.deleted'])
 
 /** Domain metrics, declared rather than inferred from a log line — AD-20. */
 export function registerServiceMetrics(metrics: Metrics): Metrics {
@@ -609,6 +625,59 @@ function buildRoutes(): Route[] {
       if (!rendered) return errorReply(404, 'not_found', 'no such token', ctx.requestId)
       return { status: 200, body: rendered }
     }),
+
+    /**
+     * The inbound event webhook.
+     *
+     * Signature checked over the RAW BYTES before anything is parsed, with the contract's
+     * timing-safe verifier: a byte-at-a-time comparison of a MAC is a byte-at-a-time forgery
+     * oracle, and parsing before verifying means an unauthenticated caller reaches the JSON parser.
+     *
+     * **403 and not 401.** This is not a bearer-token surface. A 401 says "present a credential",
+     * which invites the caller to go and find a token; the MAC is the credential, and it did not
+     * verify.
+     *
+     * A topic this service does not subscribe to is acknowledged and IGNORED — never 4xx'd. A 4xx
+     * makes the producer's relay treat the delivery as retryable and re-send the same event for
+     * ever, which is how one unsubscribed topic becomes a permanent backlog.
+     */
+    define('POST', '/v1/events', async (ctx, deps) => {
+      const raw = await readRaw(ctx.req)
+      const presented = headerOf(ctx.req, SIGNATURE_HEADER)
+      if (!presented || !verifyEventSignature(raw, deps.eventAcceptSecrets, presented)) {
+        return errorReply(403, 'bad_signature', 'the event signature did not verify', ctx.requestId)
+      }
+      let envelope: { id?: unknown; topic?: unknown; payload?: Record<string, unknown> }
+      try {
+        envelope = JSON.parse(raw) as typeof envelope
+      } catch {
+        throw new BadRequestError('the event body is not valid JSON')
+      }
+      const topic = typeof envelope.topic === 'string' ? envelope.topic : ''
+      const eventId = typeof envelope.id === 'string' ? envelope.id : ''
+      if (!UUID.test(eventId)) throw new BadRequestError('the event id must be a uuid')
+      if (!SUBSCRIBED_TOPICS.has(topic)) return { status: 202, body: { status: 'ignored' } }
+
+      const outcome = await withInbox(deps.sql, topic, eventId, async (tx) => {
+        // Rule 6 of docs/ecosystem/03 §2. The whole decision — which rows go, which are
+        // anonymised, and the lawful basis for every one that stays — is in `erasure.ts`, in the
+        // code rather than in a document that can drift away from it.
+        const userId = envelope.payload?.['userId']
+        if (typeof userId !== 'string' || !UUID.test(userId)) {
+          throw new BadRequestError('identity.user.deleted requires a uuid userId')
+        }
+        return eraseUser(tx, userId)
+      })
+      // Counts and field names only. The id of the person just erased is the one thing that must
+      // not now be written to a log that outlives the rows.
+      ctx.log.info('inbound event', {
+        topic,
+        eventId,
+        outcome: outcome.status,
+        ...(outcome.status === 'processed' ? outcome.value : {}),
+      })
+      return { status: 202, body: { status: outcome.status === 'duplicate' ? 'duplicate' : 'recorded' } }
+    }),
   ]
 }
 
@@ -757,7 +826,14 @@ function readFeatures(value: unknown): readonly Feature[] {
   return out
 }
 
-async function readJson(req: IncomingMessage): Promise<Record<string, unknown>> {
+/**
+ * The body as it arrived, byte for byte.
+ *
+ * `POST /v1/events` verifies a MAC over exactly these bytes, so it cannot go through `readJson`:
+ * parse-then-re-serialise changes key order and whitespace and would fail every honest signature,
+ * and — worse — it would run the JSON parser for an unauthenticated caller.
+ */
+async function readRaw(req: IncomingMessage): Promise<string> {
   const chunks: Buffer[] = []
   let size = 0
   for await (const chunk of req) {
@@ -768,9 +844,14 @@ async function readJson(req: IncomingMessage): Promise<Record<string, unknown>> 
     if (size > MAX_BODY_BYTES) throw new BadRequestError('request body too large')
     chunks.push(buffer)
   }
-  if (size === 0) return {}
+  return Buffer.concat(chunks).toString('utf8')
+}
+
+async function readJson(req: IncomingMessage): Promise<Record<string, unknown>> {
+  const raw = await readRaw(req)
+  if (raw.length === 0) return {}
   try {
-    const parsed: unknown = JSON.parse(Buffer.concat(chunks).toString('utf8'))
+    const parsed: unknown = JSON.parse(raw)
     if (typeof parsed !== 'object' || parsed === null || Array.isArray(parsed)) {
       throw new BadRequestError('request body must be a JSON object')
     }

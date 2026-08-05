@@ -104,6 +104,10 @@ before(async () => {
     settlementAsset: 'EMBER',
     // One allowlisted subject, so both halves of the gate are exercised.
     mainnetAllowlist: [`user:${ALICE}`],
+    // `POST /v1/events` is exercised in `erasure.test.ts`, which owns the signing key. Present
+    // here because the field is required, and required because a service that will accept a signed
+    // event must be told what to accept BEFORE it starts, not on the first delivery.
+    eventAcceptSecrets: ['a-secret-this-file-never-signs-with-0123456789'],
   })
   await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', () => resolve()))
   baseUrl = `http://127.0.0.1:${(server.address() as AddressInfo).port}`

@@ -404,6 +404,103 @@ export const MIGRATIONS: readonly Migration[] = [
         );
     `,
   },
+
+  {
+    version: 7,
+    name: 'erasure_guards',
+    up: `
+      -- ══════════════════════════════════════════════════════════════════════════════════════════
+      -- RIGHT TO ERASURE, EXPRESSED IN THE SCHEMA. See src/erasure.ts for the table-by-table
+      -- decision and the lawful basis behind each half; this file holds the two invariants that
+      -- have to survive a handler somebody rewrites in a hurry.
+      --
+      -- A deleted user's token row is either GONE (it never reached a chain) or ANONYMISED (it did,
+      -- and the issuance record is retained under Art. 17(3)(b)). An anonymised row's owner is
+      -- 'erased:<uuid>', where the uuid is RANDOM and stored nowhere else — nothing anywhere maps
+      -- it back to a person.
+      -- ══════════════════════════════════════════════════════════════════════════════════════════
+
+      -- ── ONE: an owner is a person, or is provably not one ─────────────────────────────────────
+      --
+      -- The 'user:%' branch is deliberately LOOSE. It is not this migration's job to start
+      -- validating the ledger spelling of subjects written since version 4 — 'user:1' is what
+      -- migrations.test.ts and the backfill fixture insert, and tightening that here would fail on
+      -- data that has nothing to do with erasure.
+      --
+      -- The 'erased:' branch is PINNED to a uuid, exactly. That asymmetry is the whole point: an
+      -- erased owner has to be structurally distinguishable from a person by looking at the value,
+      -- so no query anywhere has to consult a list of "which subjects are really people". A loose
+      -- 'erased:%' would let a handler write 'erased:bob' and lose that.
+      --
+      -- 'organisation:%' and 'community:%' are NOT admitted, because nothing can write them: the
+      -- only two creation paths (server.ts, both calling userSubject) produce 'user:<uuid>'. The
+      -- day mint supports an organisation-owned token this constraint gets a new migration, which
+      -- is a smaller cost than admitting a shape today that the erasure handler would silently
+      -- skip — its predicate is the user subject, so an org-owned row would never be erased and
+      -- never be noticed.
+      alter table tokens
+        drop constraint if exists tokens_owner_subject_shape;
+      alter table tokens
+        add constraint tokens_owner_subject_shape check (
+          owner_subject like 'user:%'
+          or owner_subject ~ '^erased:[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$'
+        );
+
+      -- ── TWO: erasure is one-way ───────────────────────────────────────────────────────────────
+      --
+      -- "An anonymised row can never be re-attributed to a person" is not a property a handler can
+      -- hold on its own — it binds every future UPDATE from every future code path, including a
+      -- psql session. A CHECK cannot express it because a CHECK cannot see the OLD row.
+      --
+      -- A plain BEFORE UPDATE trigger rather than a CONSTRAINT TRIGGER: a constraint trigger fires
+      -- AFTER the row is written and may be deferred, and a rule that can be deferred to the end of
+      -- a transaction is a rule that a long transaction can act on before it fires. This one
+      -- refuses before the write.
+      --
+      -- owner_wallet_id is guarded alongside owner_subject. It is overwritten by the same erasure —
+      -- a dangling pointer into the custody service is worse than an opaque one — so leaving it
+      -- writable would leave the re-attribution route open one column to the left. Nothing legally
+      -- updates it anyway: it is written once, at insert (tokens.ts), and never again.
+      create or replace function mint_owner_erasure_is_one_way() returns trigger as $fn$
+      begin
+        if old.owner_subject like 'erased:%'
+           and new.owner_subject is distinct from old.owner_subject then
+          raise exception 'an erased owner cannot be re-attributed (token %)', old.id
+            using errcode = 'restrict_violation';
+        end if;
+        if old.owner_subject like 'erased:%'
+           and new.owner_wallet_id is distinct from old.owner_wallet_id then
+          raise exception 'an erased owner''s wallet pointer cannot be rewritten (token %)', old.id
+            using errcode = 'restrict_violation';
+        end if;
+        return new;
+      end;
+      $fn$ language plpgsql;
+
+      drop trigger if exists tokens_owner_erasure_is_one_way on tokens;
+      create trigger tokens_owner_erasure_is_one_way
+        before update on tokens
+        for each row
+        execute function mint_owner_erasure_is_one_way();
+
+      -- ── THE THIRD INVARIANT, AND WHY IT IS NOT HERE ───────────────────────────────────────────
+      --
+      -- "A token with an erased owner has no project page" is a statement about TWO tables, and
+      -- project_pages carries no copy of the owner. Neither a CHECK nor a partial unique index can
+      -- reach across the join, and the only schema-level shape that could is a second trigger on
+      -- project_pages that reads tokens on every insert — a per-row cross-table read on the write
+      -- path of a feature that has nothing to do with erasure.
+      --
+      -- It is therefore enforced in the handler (erasure.ts deletes every page of every token of
+      -- the erased subject, on BOTH branches) and asserted in erasure.test.ts. Said out loud here
+      -- rather than left as an absence, because an absent invariant that nobody wrote down is the
+      -- one that comes back.
+      --
+      -- The exposure this leaves is bounded: the only writer is PUT /v1/tokens/:id/page, which
+      -- resolves the token by the CALLER's own user subject. An erased user has no account to
+      -- authenticate with, so no live path can re-create a page for an erased token.
+    `,
+  },
 ]
 
 /**

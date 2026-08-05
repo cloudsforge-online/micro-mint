@@ -13,7 +13,7 @@ Design authority: [`ecosystem/03-repository-responsibilities.md`](https://github
 > **`POST /v1/tokens/:id/deploy` answers 202 and a status URL. It reaches no chain.** The whole
 > handler is authenticate, check the mainnet allowlist, one conditional UPDATE to confirm the order
 > can be deployed, one enqueue, and a `Location` header — it cannot take more than a few
-> milliseconds because there is nothing in it that can (`src/server.ts:7-22`, handler at `:515`).
+> milliseconds because there is nothing in it that can (`src/server.ts:7-22`, handler at `:542`).
 > **The frozen service held the request for up to 180 seconds**, awaiting a settlement pass, a
 > balance read, a nonce read, a fee read, a gas estimate, a fifteen-second signing call, a
 > broadcast, and then a receipt (`src/deploy.ts:8-11`).
@@ -59,35 +59,55 @@ after the send is covered because the hash was written **with** the bytes.
 Read out of `src/server.ts`. Every domain route is served under `/v1` **only** — there is no
 unprefixed spelling here, unlike `micro-indexer`.
 
-`authenticate()` resolves the bearer token and checks **nothing else** (`src/server.ts:671`). Scope
+`authenticate()` resolves the bearer token and checks **nothing else** (`src/server.ts:766`). Scope
 is checked per-route and **only for service principals**: `if (principal.kind === 'service')
 requireScope(principal, …)`. A user token is authorised by **ownership** instead — `ownedToken()`
-looks the row up by owner subject, or by id if the principal is an `admin` (`src/server.ts:628-638`).
+looks the row up by owner subject, or by id if the principal is an `admin` (`src/server.ts:708-720`).
 
 | Method | Path | Who | Idempotency-Key | What it does |
 | --- | --- | --- | --- | --- |
-| `GET` | `/livez` | **no auth** | — | liveness (`src/server.ts:328`) |
-| `GET` | `/readyz` | **no auth** | — | 200/503 (`src/server.ts:330`) |
-| `GET` | `/metrics` | **no auth** | — | Prometheus text (`src/server.ts:338`) |
-| `GET` | `/v1/catalogue` | **no auth** | — | price, network and the three variants. **Public deliberately**: a catalogue behind a token cannot be browsed (`src/server.ts:354`, reasoning at `:353`) |
-| `POST` | `/v1/tokens` | user, or service with `mint:write` | **none — see below** | opens an order. **Nothing is charged and nothing is deployed**, and **an order that could not be built is refused here** (`src/server.ts:373`, scope at `:375`, gate at `:412`) |
-| `GET` | `/v1/tokens` | user, or service with `mint:read` | — | the caller's orders. An `admin` may name another subject (`src/server.ts:441`, `:445`) |
-| `GET` | `/v1/tokens/:id` | owner or admin | — | the order, plus **every deploy attempt**, so "what happened" is answered from the row rather than a log search (`src/server.ts:454`, `:465-472`) |
-| `POST` | `/v1/tokens/:id/pay` | owner, or service with `mint:write` | **none** | debits Shards and moves the order to `paid`. **One transaction: the ledger entry and the state change together.** 201 fresh, **200 on a replay**, so a client can tell whether its retry did the work (`src/server.ts:478`, status at `:501`) |
-| `POST` | `/v1/tokens/:id/deploy` | owner, or service with `mint:write` | **none** | **202 + `Location`.** Enqueues `token.deploy`. The mainnet allowlist is checked **here, before anything is queued**, so a refusal costs a request rather than a job that dead-letters somewhere an operator has to go and read (`src/server.ts:515`, allowlist at `:533-542`) |
-| `PUT` | `/v1/tokens/:id/page` | owner, or service with `mint:write` | — | upserts the editorial half of the project page (`src/server.ts:570`) |
-| `GET` | `/v1/tokens/:id/page` | **no auth** | — | renders the page: editorial fields from this database, **on-chain facts from the indexer** (`src/server.ts:596`) |
+| `GET` | `/livez` | **no auth** | — | liveness (`src/server.ts:348`) |
+| `GET` | `/readyz` | **no auth** | — | 200/503 (`src/server.ts:350`) |
+| `GET` | `/metrics` | **no auth** | — | Prometheus text (`src/server.ts:358`) |
+| `GET` | `/v1/catalogue` | **no auth** | — | price, network and the three variants. **Public deliberately**: a catalogue behind a token cannot be browsed (`src/server.ts:374`, reasoning at `:373`) |
+| `POST` | `/v1/tokens` | user, or service with `mint:write` | **none — see below** | opens an order. **Nothing is charged and nothing is deployed**, and **an order that could not be built is refused here** (`src/server.ts:400`, scope at `:402`, gate at `:439`) |
+| `GET` | `/v1/tokens` | user, or service with `mint:read` | — | the caller's orders. An `admin` may name another subject (`src/server.ts:468`, `:472`) |
+| `GET` | `/v1/tokens/:id` | owner or admin | — | the order, plus **every deploy attempt**, so "what happened" is answered from the row rather than a log search (`src/server.ts:481`, `:485`) |
+| `POST` | `/v1/tokens/:id/pay` | owner, or service with `mint:write` | **none** | debits Shards and moves the order to `paid`. **One transaction: the ledger entry and the state change together.** 201 fresh, **200 on a replay**, so a client can tell whether its retry did the work (`src/server.ts:505`, status at `:527`) |
+| `POST` | `/v1/tokens/:id/deploy` | owner, or service with `mint:write` | **none** | **202 + `Location`.** Enqueues `token.deploy`. The mainnet allowlist is checked **here, before anything is queued**, so a refusal costs a request rather than a job that dead-letters somewhere an operator has to go and read (`src/server.ts:542`, allowlist at `:562`) |
+| `PUT` | `/v1/tokens/:id/page` | owner, or service with `mint:write` | — | upserts the editorial half of the project page (`src/server.ts:597`) |
+| `GET` | `/v1/tokens/:id/page` | **no auth** | — | renders the page: editorial fields from this database, **on-chain facts from the indexer** (`src/server.ts:623`) |
+| `POST` | `/v1/events` | **HMAC, not a token** | — | the inbound event webhook. Subscribes to **`identity.user.deleted`** and erases (`src/server.ts:644`, decision table in `src/erasure.ts`). Signature checked over the **raw bytes before anything is parsed**; a bad one is **403, never 401** — the MAC is the credential, and a 401 invites the caller to go and find a token. An unsubscribed topic is **202 ignored**, because a 4xx makes the producer's relay retry the same event for ever |
 
 **Four routes make no `authenticate()` call**: `/livez`, `/readyz`, `/metrics` and
 `/v1/catalogue` — plus `GET /v1/tokens/:id/page`, which is a public page by design
-(`src/server.ts:596`).
+(`src/server.ts:623`), and `POST /v1/events`, which authenticates a **delivery** rather than a
+principal.
+
+### Right to erasure
+
+Rule 6 of `docs/ecosystem/03 §2`. `identity.user.deleted` arrives on `POST /v1/events` and
+`src/erasure.ts` runs inside `withInbox`, so the dedupe row and every write commit together.
+
+**A deployed token is on a public blockchain and cannot be un-deployed**, which is what splits the
+decision: a token with **no `deploy_tx_hash`** never had bytes signed for it and is **deleted**
+outright; a token that **has one** may already be on a chain, so its owner is **anonymised** to a
+random `erased:<uuid>` and its `owner_address`, `deploy_tx_hash` and `contract_address` are
+**retained under Art. 17(3)(b)** as this platform's record of an issuance it performed. Project
+pages are **deleted on both branches** — user-authored copy about the user and about named third
+parties, with no retention basis. The full table, table by table with the basis for each retention,
+is the header of `src/erasure.ts`, in the code so it cannot drift from the behaviour.
+
+Migration 7 puts the two invariants in the schema rather than only in the handler: `owner_subject`
+is a person or is **exactly** `erased:<uuid>`, and a `before update` trigger refuses to turn an
+erased owner back into a person.
 
 "Does not exist" and "is not yours" are **the same 404** on purpose: a distinct 403 for the second
 is an oracle that lets an unauthorised caller enumerate which order ids exist
-(`src/server.ts:625-626`).
+(`src/server.ts:696-697`).
 
 Amounts cross the wire as **strings** — a supply of 10²⁴ is an ordinary token and does not survive a
-JSON number (`src/server.ts:713`).
+JSON number (`src/server.ts:732`).
 
 ### An order that cannot be built is refused before it can be paid for
 
