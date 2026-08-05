@@ -26,7 +26,7 @@
 
 import { hostname } from 'node:os'
 import type { IssuableAssetCode, Network } from '@cloudsforge/contracts-chain'
-import { assertGeneratedSecret } from '@cloudsforge/secrets'
+import { assertGeneratedSecret, assertServiceCredential, SecretError } from '@cloudsforge/secrets'
 
 /**
  * The service's own name. A constant rather than a variable: it is a property of the repository,
@@ -43,23 +43,6 @@ export class EnvError extends Error {
   }
 }
 
-/**
- * Values that must never be accepted. The list holds the strings that actually appear in this
- * repository's own `.env.example` and compose files, because those are the ones that get copied
- * into a deployment by someone in a hurry.
- */
-const PLACEHOLDERS = new Set([
-  'changeme',
-  'change-me',
-  'placeholder',
-  'secret',
-  'token',
-  'dev-secret',
-  'dev-outbox-signing-secret',
-  'replace-with-a-real-secret',
-  'xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx',
-])
-
 type Source = Readonly<Record<string, string | undefined>>
 
 function required(source: Source, name: string): string {
@@ -68,24 +51,25 @@ function required(source: Source, name: string): string {
   return value
 }
 
-function requiredSecret(source: Source, name: string, minLength = 24): string {
-  const value = required(source, name)
-  if (PLACEHOLDERS.has(value.toLowerCase())) {
-    throw new EnvError(`${name} is set to a known placeholder — generate a real secret`)
-  }
-  // Length is a proxy for entropy and the only one available here. It is set above the point at
-  // which a human-chosen string is plausible, so a memorable password fails this check too.
-  if (value.length < minLength) {
-    throw new EnvError(`${name} must be at least ${minLength} characters (got ${value.length})`)
-  }
-  return value
+/**
+ * `@cloudsforge/secrets` raises `SecretError`; this file's contract is that `loadEnv` raises
+ * `EnvError`, and every test and caller in this repository is written to that.
+ *
+ * So a shape failure is re-wrapped rather than rethrown, and the message is carried across
+ * VERBATIM: it already names the variable and the command that fixes it, and by construction it
+ * contains no part of the value. Only the class changes, so there is one thing to catch here and
+ * nothing to re-derive by matching on text.
+ */
+function asEnvError(err: unknown): never {
+  throw err instanceof SecretError ? new EnvError(err.message) : err
 }
 
 /**
  * The estate's shared event-bus HMAC key, held to a shape rather than to a deny-list.
  *
- * `requiredSecret` above cannot be the guard for this one. It refuses a fixed list of exact
- * strings and anything under 24 characters, and the value that sat on 54 lines of a PUBLIC compose
+ * THE LOCAL `requiredSecret`, `optionalSecret` AND `PLACEHOLDERS` ARE GONE RATHER THAN KEPT IN
+ * FRONT. They refused a fixed list of exact strings and anything under 24 characters, and the
+ * value that sat on 54 lines of a PUBLIC compose
  * file — `estate-only-outbox-secret-00000000000000` — was on no list and was 40 characters, so it
  * passed every service in the estate (micro-org #142). A check that could not fail read as the
  * absence of a problem. It matters here more than most: this key is what tells `micro-ledger` that
@@ -96,33 +80,55 @@ function requiredSecret(source: Source, name: string, minLength = 24): string {
  * keystrokes, and a measured Shannon entropy floor. It has no NODE_ENV exemption and no escape
  * hatch, so CI generates a real value per run rather than being let through.
  *
- * `required` rather than `requiredSecret`, deliberately: the weaker checks are a strict subset of
- * the stronger ones, and running them first would answer a 40-character placeholder with "must be
- * at least 24 characters" — a message that is true, useless, and points the operator at the wrong
- * property.
+ * `required` in front of it and nothing else, deliberately: the deleted checks were a strict
+ * subset of the stronger ones, and running them first would answer a 40-character placeholder with
+ * "must be at least 24 characters" — a message that is true, useless, and points the operator at
+ * the wrong property.
  */
 function requiredSigningSecret(source: Source, name: string): string {
   const value = required(source, name)
-  assertGeneratedSecret(name, value)
+  try {
+    assertGeneratedSecret(name, value)
+  } catch (err) {
+    asEnvError(err)
+  }
   return value
 }
 
 /**
- * A secret that may be absent, but must be real if present.
+ * A service credential that may be absent, but must be a REAL credential if present.
  *
- * The distinction matters for the identity credential: absent is a deployment that has not been
- * given one yet and is reported by `/readyz`; a short placeholder is a deployment that believes it
- * HAS one, and would fail on its first call to a peer with a 401 that reads as "identity rejected
- * this service" rather than "nobody set this variable".
+ * The distinction matters: absent is a deployment that has not been given one yet and is reported
+ * by `/readyz`; a placeholder is a deployment that believes it HAS one, and fails on its first call
+ * to a peer with a 401 that reads as "identity rejected mint" rather than "nobody set this
+ * variable".
+ *
+ * ── WHY THIS IS `assertServiceCredential` AND NOT THE SIGNING-KEY RULE ────────────────────────
+ *
+ * The guard class is not predictable from the variable's NAME, so it was MEASURED rather than
+ * inferred — the estate has `*_TOKEN` variables holding `cfsc_` credentials and `*_TOKEN` variables
+ * holding JWTs under the same suffix. `MINT_IDENTITY_CREDENTIAL` on the live estate, 2026-08-06:
+ *
+ *     mainnet   cfsc_ + 43 characters, base64url body, CONTAINS A HYPHEN
+ *     testnet   cfsc_ + 43 characters, base64url body
+ *
+ * A credential is minted by micro-identity, not by `openssl`, so it is neither wholly base64 nor
+ * wholly hex — the underscore in its own `cfsc_` prefix disqualifies it. Pointing this at
+ * `assertGeneratedSecret`, which is the obvious-looking reuse, would refuse every credential the
+ * estate has ever minted and exit 1 at boot on BOTH networks.
+ *
+ * THE BODY MAY CONTAIN A HYPHEN, and one of the two estates' does while the other's does not — see
+ * the measurement above. A "no hyphens" rule is correct for a generated key, reads as obviously
+ * right in review, and would pass one network while killing the other at boot. `@cloudsforge/secrets`
+ * pins a hyphenated fixture so that regression fails CI rather than an estate.
  */
-function optionalSecret(source: Source, name: string, minLength = 24): string | null {
+function optionalCredential(source: Source, name: string): string | null {
   const value = source[name]?.trim()
   if (!value) return null
-  if (PLACEHOLDERS.has(value.toLowerCase())) {
-    throw new EnvError(`${name} is set to a known placeholder — generate a real secret`)
-  }
-  if (value.length < minLength) {
-    throw new EnvError(`${name} must be at least ${minLength} characters (got ${value.length})`)
+  try {
+    assertServiceCredential(name, value)
+  } catch (err) {
+    asEnvError(err)
   }
   return value
 }
@@ -386,9 +392,9 @@ export function loadEnv(source: Source = process.env, host = ''): Env {
     ledgerUrl: required(source, 'LEDGER_URL'),
     pricingUrl: required(source, 'PRICING_URL'),
     identityUrl: optional(source, 'IDENTITY_URL', required(source, 'IDENTITY_ISSUER')),
-    // Not `requiredSecret`: see the field comment. The absence is caught by `/readyz`, which is
+    // Optional, not required: see the field comment. The absence is caught by `/readyz`, which is
     // a check that can fail, rather than by a boot CI cannot perform.
-    identityCredential: optionalSecret(source, 'MINT_IDENTITY_CREDENTIAL'),
+    identityCredential: optionalCredential(source, 'MINT_IDENTITY_CREDENTIAL'),
     legacyServiceTokenPresent: (source['MINT_SERVICE_TOKEN']?.trim() ?? '').length > 0,
     upstreamDeadlineMs: integer(source, 'MINT_UPSTREAM_DEADLINE_MS', 5_000, 100, 60_000),
 
