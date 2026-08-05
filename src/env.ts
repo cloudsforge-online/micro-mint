@@ -26,6 +26,7 @@
 
 import { hostname } from 'node:os'
 import type { IssuableAssetCode, Network } from '@cloudsforge/contracts-chain'
+import { assertGeneratedSecret } from '@cloudsforge/secrets'
 
 /**
  * The service's own name. A constant rather than a variable: it is a property of the repository,
@@ -77,6 +78,32 @@ function requiredSecret(source: Source, name: string, minLength = 24): string {
   if (value.length < minLength) {
     throw new EnvError(`${name} must be at least ${minLength} characters (got ${value.length})`)
   }
+  return value
+}
+
+/**
+ * The estate's shared event-bus HMAC key, held to a shape rather than to a deny-list.
+ *
+ * `requiredSecret` above cannot be the guard for this one. It refuses a fixed list of exact
+ * strings and anything under 24 characters, and the value that sat on 54 lines of a PUBLIC compose
+ * file — `estate-only-outbox-secret-00000000000000` — was on no list and was 40 characters, so it
+ * passed every service in the estate (micro-org #142). A check that could not fail read as the
+ * absence of a problem. It matters here more than most: this key is what tells `micro-ledger` that
+ * a mint event is genuinely from mint, and a forgeable one is a forgeable token supply.
+ *
+ * `assertGeneratedSecret` asserts what a placeholder cannot have: the base64 or hex alphabet (no
+ * hyphens — every placeholder this estate wrote had one), 32 decoded BYTES rather than 24
+ * keystrokes, and a measured Shannon entropy floor. It has no NODE_ENV exemption and no escape
+ * hatch, so CI generates a real value per run rather than being let through.
+ *
+ * `required` rather than `requiredSecret`, deliberately: the weaker checks are a strict subset of
+ * the stronger ones, and running them first would answer a 40-character placeholder with "must be
+ * at least 24 characters" — a message that is true, useless, and points the operator at the wrong
+ * property.
+ */
+function requiredSigningSecret(source: Source, name: string): string {
+  const value = required(source, name)
+  assertGeneratedSecret(name, value)
   return value
 }
 
@@ -351,7 +378,7 @@ export function loadEnv(source: Source = process.env, host = ''): Env {
     databasePoolMax: integer(source, 'MINT_DATABASE_POOL_MAX', 10, 1, 100),
     identityJwksUrl: required(source, 'IDENTITY_JWKS_URL'),
     identityIssuer: required(source, 'IDENTITY_ISSUER'),
-    outboxSigningSecret: requiredSecret(source, 'OUTBOX_SIGNING_SECRET'),
+    outboxSigningSecret: requiredSigningSecret(source, 'OUTBOX_SIGNING_SECRET'),
     instanceId: optional(source, 'INSTANCE_ID', host || 'unknown'),
 
     custodyUrl: required(source, 'CUSTODY_URL'),

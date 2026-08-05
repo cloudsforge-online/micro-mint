@@ -8,6 +8,7 @@
 
 import assert from 'node:assert/strict'
 import test from 'node:test'
+import { randomBytes } from 'node:crypto'
 
 /**
  * A valid environment, applied to the process BEFORE `./env.ts` is imported.
@@ -21,7 +22,11 @@ const BASE: Record<string, string> = {
   MINT_DATABASE_URL: 'postgres://mint:mint@127.0.0.1:5432/mint',
   IDENTITY_JWKS_URL: 'http://127.0.0.1:4001/.well-known/jwks.json',
   IDENTITY_ISSUER: 'http://127.0.0.1:4001',
-  OUTBOX_SIGNING_SECRET: 'a-real-looking-secret-of-sufficient-length',
+  // GENERATED, not written. `assertGeneratedSecret` refuses a typed value, and a fixture exempt
+  // from the rule it is meant to exercise is how the placeholder in micro-org #142 survived every
+  // test in the estate. The literal that used to sit here — "a-real-looking-secret-of-sufficient-
+  // length" — is now refused twice over: it is not base64, and it reads as a placeholder.
+  OUTBOX_SIGNING_SECRET: randomBytes(48).toString('base64'),
   CUSTODY_URL: 'http://127.0.0.1:4005',
   INDEXER_URL: 'http://127.0.0.1:4008',
   LEDGER_URL: 'http://127.0.0.1:4007',
@@ -59,13 +64,54 @@ test('a known placeholder secret is refused outright', () => {
   )
 })
 
-test('a short secret is refused, because length is the only entropy proxy available', () => {
+test('a short secret is refused, on bytes for the signing key and on length for the credential', () => {
   // MINT_SERVICE_TOKEN used to be the subject here; it is retired, and the credential that
   // replaced it takes the same length floor for the same reason.
-  assert.throws(() => loadEnv({ ...BASE, OUTBOX_SIGNING_SECRET: 'short' }, 'host'), /at least 24/)
+  //
+  // The two messages differ on purpose. The signing key is measured in DECODED BYTES, because 32
+  // characters of prose is not 32 bytes of key; the credential is still on the old character
+  // floor, which is all a deny-list guard can say.
+  assert.throws(
+    () => loadEnv({ ...BASE, OUTBOX_SIGNING_SECRET: 'short' }, 'host'),
+    /3 bytes of key material/,
+  )
   assert.throws(
     () => loadEnv({ ...BASE, MINT_IDENTITY_CREDENTIAL: 'short' }, 'host'),
     /at least 24/,
+  )
+})
+
+test('THE VALUE THAT SAT IN A PUBLIC REPOSITORY IS REFUSED, and every near miss with it', () => {
+  // micro-org #142. Each of these cleared the old guard — a deny-list of exact strings plus a
+  // 24-character floor — and each is a real string that was deployed or set in CI, not an invented
+  // one. If a future edit weakens the floor, it fails against evidence rather than against taste.
+  for (const value of [
+    'estate-only-outbox-secret-00000000000000', // 54 lines of a PUBLIC compose file, 40 chars
+    'ci-only-not-a-real-secret-000000000000', // this workflow's own former smoke-env value
+    'K2sN4vQ8xR1wB6tY9zL3mF7hC5jD0pA4', // the estate's former test fixture: 32 chars, 24 bytes
+    '0'.repeat(64), // right alphabet, right length, no entropy
+  ]) {
+    assert.throws(
+      () => loadEnv({ ...BASE, OUTBOX_SIGNING_SECRET: value }, 'host'),
+      (err: unknown) => {
+        // The refusal must not echo the value: the reason this guard exists is that the value was
+        // readable, and a message carrying it moves the secret to the log collector.
+        const message = (err as Error).message
+        assert.ok(!message.includes(value), 'the refusal echoed the value')
+        assert.match(message, /OUTBOX_SIGNING_SECRET/)
+        assert.match(message, /openssl rand -base64 48/)
+        return true
+      },
+    )
+  }
+})
+
+test('a generated secret is accepted, in either alphabet', () => {
+  assert.doesNotThrow(() =>
+    loadEnv({ ...BASE, OUTBOX_SIGNING_SECRET: randomBytes(48).toString('base64') }, 'host'),
+  )
+  assert.doesNotThrow(() =>
+    loadEnv({ ...BASE, OUTBOX_SIGNING_SECRET: randomBytes(32).toString('hex') }, 'host'),
   )
 })
 

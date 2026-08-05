@@ -28,7 +28,7 @@
 
 import assert from 'node:assert/strict'
 import { test } from 'node:test'
-import { createHmac } from 'node:crypto'
+import { createHmac, randomBytes } from 'node:crypto'
 import { readFileSync, readdirSync } from 'node:fs'
 import { dirname, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
@@ -425,7 +425,10 @@ test('THE RULE: a confirmed deploy reaches the person whose contract it is', () 
 
 /* ------------------------------------------------------------------ the delivery */
 
-const SECRET = 'K2sN4vQ8xR1wB6tY9zL3mF7hC5jD0pA4'
+// GENERATED, never a committed literal. This used to be the estate's shared test fixture — 32
+// characters but only 24 bytes — and `env.ts` now refuses it, so a fixture spelling it out would
+// be signing with a value no deploy of this service can hold (micro-org #142).
+const SECRET = randomBytes(48).toString('base64')
 
 test('the delivery this relay signs is one a contract-following consumer verifies', () => {
   const built = buildEnvelope(ROW)
