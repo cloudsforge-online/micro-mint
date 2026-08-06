@@ -16,7 +16,7 @@
  *
  * It needs `micro-indexer` on disk, and `pnpm test` has to pass without it. The estate has already
  * settled this: "an invariant needing a private sibling is a JOB, not a test"
- * (`micro-sdk/.github/workflows/ci.yml:16-22`). A test would have to skip, and a skipped test is an
+ * (`micro-sdk/.github/workflows/ci.yml`). A test would have to skip, and a skipped test is an
  * unmeasured one. So CI checks the indexer out and runs this, and then MUTATES the checkout and
  * requires this to go red — because a job that grades a file it failed to fetch looks exactly like
  * a job that passed.

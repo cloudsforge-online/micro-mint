@@ -67,7 +67,7 @@
  * │                            │ wallet id out │
  * │                            │ of `detail`   │ `detail` is the exception and it is not
  * │                            │               │ theoretical: it is err.message from custody or a
- * │                            │               │ chain node (deploy.ts:128,141,155,336), free text
+ * │                            │               │ chain node (deploy.ts,141,155,336), free text
  * │                            │               │ this service does not author. A custody refusal
  * │                            │               │ can echo the wallet id back. Leaving it there
  * │                            │               │ would undo the anonymisation of owner_wallet_id
@@ -83,9 +83,9 @@
  * │                            │ .ownerSubject │ mint.token.paid, mint.deploy.confirmed and
  * │                            │ payload       │ mint.token.failed each carry ownerSubject
  * │                            │ .userId       │ ('user:<uuid>'); the confirmed payload also
- * │                            │ actor         │ carries a bare userId (tokens.ts:686) and the
+ * │                            │ actor         │ carries a bare userId (tokens.ts) and the
  * │                            │               │ `actor` column is 'user:<uuid>'
- * │                            │               │ (server.ts:774). Nothing prunes this table, so
+ * │                            │               │ (server.ts). Nothing prunes this table, so
  * │                            │               │ every one of those is kept for ever. An erasure
  * │                            │               │ that emptied `tokens` and left the outbox would
  * │                            │               │ be an erasure in name.
@@ -102,7 +102,7 @@
  * │ inbox, outbox_deliveries,  │ UNTOUCHED     │ (topic, event_id) pairs, delivery counters and
  * │ event_subscriptions, jobs  │               │ subscription URLs. Checked, not assumed: the only
  * │                            │               │ job this service enqueues carries { tokenId }
- * │                            │               │ (server.ts:577) — a token id, not a user id — and
+ * │                            │               │ (server.ts) — a token id, not a user id — and
  * │                            │               │ a claim for a token that has just been deleted
  * │                            │               │ finds no row and completes. The whole-row scan in
  * │                            │               │ erasure.test.ts covers all four, so a column
@@ -156,9 +156,9 @@ export const ERASED_SUBJECT =
  */
 export async function eraseUser(tx: Tx, userId: string): Promise<ErasureOutcome> {
   // The event carries a BARE UUID; this service stores the LEDGER SPELLING, 'user:<uuid>'
-  // (migrations.ts:117). Converted with the contract's own helper rather than by concatenating a
+  // (migrations.ts). Converted with the contract's own helper rather than by concatenating a
   // string, so the spelling the erasure looks for and the spelling the write path produces
-  // (server.ts:444, 514 — both `userSubject`) are the same function and cannot drift. It also
+  // (server.ts, 514 — both `userSubject`) are the same function and cannot drift. It also
   // rejects a malformed id rather than composing a subject that quietly matches nothing, which is
   // the failure mode where an erasure reports success and erases zero rows.
   const subject = userSubject(userId)
@@ -213,7 +213,7 @@ export async function eraseUser(tx: Tx, userId: string): Promise<ErasureOutcome>
   `
 
   // Everything with no transaction hash. `token_deploy_attempts` goes with it by ON DELETE CASCADE
-  // (migrations.ts:210) — relied on here, and proved rather than assumed in erasure.test.ts.
+  // (migrations.ts) — relied on here, and proved rather than assumed in erasure.test.ts.
   //
   // The predicate is `deploy_tx_hash is null` and NOT `broadcast_at is null`, and the difference is
   // the window this whole repository is built around. A row with a hash but no broadcast_at has had
@@ -247,7 +247,7 @@ export async function eraseUser(tx: Tx, userId: string): Promise<ErasureOutcome>
   // JSON null, not the placeholder: `userId` is a BARE uuid on the wire and every reader in the
   // estate parses it as one (activity's classifier, notify's userIdOf). Writing 'erased:<uuid>'
   // there would be a malformed user id rather than an absent one. Null is the value this payload
-  // already carries when the owner is not a person (tokens.ts:686), so every consumer's null path
+  // already carries when the owner is not a person (tokens.ts), so every consumer's null path
   // is the one that already exists.
   await tx`
     update outbox

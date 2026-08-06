@@ -33,10 +33,10 @@
  *
  *   `transaction`  asked `/v1/chains/:chain/:network/transactions/:hash`. The route exists, spelled
  *                  the other way round — `/v1/transactions/:chain/:network/:hash`
- *                  (`indexer/src/server.ts:157`).
+ *                  (`indexer/src/server.ts`).
  *   `token`        asked `/v1/chains/:chain/:network/tokens/:address`, and the indexer had no token
  *                  route in any spelling. It has one now: `/v1/tokens/:chain/:network/:address`
- *                  (`indexer/src/server.ts:159`), which reads the contract's own state at the
+ *                  (`indexer/src/server.ts`), which reads the contract's own state at the
  *                  canonical head this service's follower has walked.
  *
  * Neither failure had a symptom, because **a 404 was read as an answer**. `token()` returned null on
@@ -198,7 +198,7 @@ export function httpIndexerClient(options: IndexerClientOptions): IndexerClient 
     async transaction(chain, network, hash) {
       // The indexer's own convention: the RESOURCE first, then `:chain/:network`, then the key.
       // `/chains/...` is the status route's shape and only the status route's — asking for it here
-      // is what made this call a permanent 404 (`indexer/src/server.ts:157`).
+      // is what made this call a permanent 404 (`indexer/src/server.ts`).
       //
       // ONE template literal, not two concatenated. `checkindexerroutes.mjs` scans this file for the
       // paths it requests, and a path split across a `+` reaches that scan as a fragment it cannot

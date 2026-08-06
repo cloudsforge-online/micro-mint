@@ -3,7 +3,7 @@
  *
  * ---------------------------------------------------------------------------------------------
  * **THE DEFECT THIS FILE EXISTS TO FIX.** The frozen service does this
- * (`forge-mint/src/routes/tokens.ts:258-272`):
+ * (`forge-mint/src/routes/tokens.ts`):
  *
  *     const result = await spendShards(bearer, offer.shardPrice, …, `forge-mint:order:${id}`, …)
  *     if (result.insufficient) return 402

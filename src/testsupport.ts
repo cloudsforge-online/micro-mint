@@ -356,7 +356,7 @@ export function fakeIndexer(): FakeIndexer {
 /**
  * The rate at which the fixtures below convert: **$0.25 to one EMBER**, at `RATE_SCALE`.
  *
- * `RATE_SCALE` is 1,000,000 (`contracts/packages/chain/src/index.ts:358`), so $0.25 is 250,000 and
+ * `RATE_SCALE` is 1,000,000 (`contracts/packages/chain/src/index.ts`), so $0.25 is 250,000 and
  * NOT 250,000,000. That distinction is written down because this file had the second number for one
  * draft, and the only symptom was a charge a thousand times too small — no type error, no
  * exception, a perfectly balanced entry for the wrong amount of money. Reading the scale rather
@@ -364,7 +364,7 @@ export function fakeIndexer(): FakeIndexer {
  * of trusting it.
  *
  * The value is the administered figure `micro-pricing` is actually seeded with
- * (`pricing/src/migrations.ts:185`), so these tests convert at the number the live rate board
+ * (`pricing/src/migrations.ts`), so these tests convert at the number the live rate board
  * carries rather than a round one chosen to make the arithmetic easy. At this rate $25.00 — 2,500
  * cents, the default deploy price — settles to exactly 100 EMBER.
  */

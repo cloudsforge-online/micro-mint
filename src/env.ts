@@ -250,7 +250,7 @@ export interface Env {
    * **The long-lived credential this service exchanges for short-lived tokens.**
    *
    * It replaces `MINT_SERVICE_TOKEN`, which was a 600-second token read once at boot
-   * (identity/src/tokens.ts:28). Ten minutes into any deployment it expired and every call to a
+   * (identity/src/tokens.ts). Ten minutes into any deployment it expired and every call to a
    * peer failed; nothing could re-mint it, because minting requires the `admin` role. A credential
    * is not a token: it confers nothing by itself, it is revocable, and it survives a restart. See
    * `micro-identity` `src/serviceCredentials.ts` and `@cloudsforge/auth` `ServiceTokenProvider`.

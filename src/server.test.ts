@@ -244,8 +244,8 @@ test('a feature set no committed contract provides is refused BEFORE payment', {
  * The cap rule ran for the first time in `constructorArgs`, inside the deploy job — so a foundry
  * order with no cap was accepted, then charged by `POST /v1/tokens/:id/pay`, and only then found
  * to be unbuildable. It did not even fail cleanly: the `ChainError` from `dataFor` matches none of
- * `driveDeploy`'s four classified failures (`deploy.ts:118-169`), so the lease was released, the
- * row stayed `deploying`, `deploying` is in `CLAIMABLE` (`tokens.ts:68-73`), and the sweep put it
+ * `driveDeploy`'s four classified failures (`deploy.ts`), so the lease was released, the
+ * row stayed `deploying`, `deploying` is in `CLAIMABLE` (`tokens.ts`), and the sweep put it
  * straight back on the queue. A permanent loop with the customer's Shards already spent.
  *
  * This asserts the money consequence directly: after the refusal there is no order to pay for, and

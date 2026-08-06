@@ -113,7 +113,7 @@ export interface DeployFamily {
    * Whether the deployer holds enough native coin to pay for this creation.
    *
    * A REAL number, not `balance > 0`. The frozen service's gate is `wei > 0n`
-   * (`routes/tokens.ts:42`), so one wei of dust passes it and the deploy then fails at
+   * (`routes/tokens.ts`), so one wei of dust passes it and the deploy then fails at
    * `estimateGas` — after the lease has been claimed and an attempt burned.
    */
   funding(ctx: DeployContext, rpc: JsonRpc, bounds: FeeBounds): Promise<FundingReport>

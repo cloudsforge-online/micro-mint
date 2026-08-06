@@ -13,23 +13,23 @@ Design authority: [`ecosystem/03-repository-responsibilities.md`](https://github
 > **`POST /v1/tokens/:id/deploy` answers 202 and a status URL. It reaches no chain.** The whole
 > handler is authenticate, check the mainnet allowlist, one conditional UPDATE to confirm the order
 > can be deployed, one enqueue, and a `Location` header — it cannot take more than a few
-> milliseconds because there is nothing in it that can (`src/server.ts:7-22`, handler at `:542`).
+> milliseconds because there is nothing in it that can (`src/server.ts`, handler).
 > **The frozen service held the request for up to 180 seconds**, awaiting a settlement pass, a
 > balance read, a nonce read, a fee read, a gas estimate, a fifteen-second signing call, a
-> broadcast, and then a receipt (`src/deploy.ts:8-11`).
+> broadcast, and then a receipt (`src/deploy.ts`).
 
 > **It renders no on-chain fact from its own row.** `project_pages` records no supply, no
 > authorities, no network and no contract address; those are read from the indexer at render time.
 > A copy on this row would be **the order's intent presented as on-chain reality**, and the two
-> diverge the moment a mint authority is renounced (`src/migrations.ts:229-232`).
+> diverge the moment a mint authority is renounced (`src/migrations.ts`).
 
 ---
 
 ## Why the 202 is the design, not a nicety
 
-`src/deploy.ts:8-24` itemises what the frozen service does inside one HTTP request and what cuts it:
+`src/deploy.ts` itemises what the frozen service does inside one HTTP request and what cuts it:
 
-* **A rolling deploy kills it.** `obs.ts:241-258` calls `process.exit(0)` ten seconds after SIGTERM
+* **A rolling deploy kills it.** `obs.ts` calls `process.exit(0)` ten seconds after SIGTERM
   whatever is in flight, so a deploy in its receipt wait has about a 95% chance of being cut. **The
   bad landing is between the broadcast and the write that records the hash**: a real signed creation
   is on the wire, the row has no record of it, the lease expires, `tx_hash IS NULL` passes, and a
@@ -46,7 +46,7 @@ claim → provision deployer → check funding → PREPARE (sign) → COMMIT byt
       → record broadcast → poll outcome
 ```
 
-and each step precedes the next for a stated reason (`src/deploy.ts:30-41`): a crash **before** the
+and each step precedes the next for a stated reason (`src/deploy.ts`): a crash **before** the
 commit has broadcast nothing and the next tick rebuilds from a fresh nonce read; a crash **after**
 the commit and before the send leaves bytes with no `broadcast_at`, and the next tick **resumes at
 broadcast with the identical bytes** — a re-send of one transaction, never a second one; a crash
@@ -59,29 +59,29 @@ after the send is covered because the hash was written **with** the bytes.
 Read out of `src/server.ts`. Every domain route is served under `/v1` **only** — there is no
 unprefixed spelling here, unlike `micro-indexer`.
 
-`authenticate()` resolves the bearer token and checks **nothing else** (`src/server.ts:766`). Scope
+`authenticate()` resolves the bearer token and checks **nothing else** (`src/server.ts`). Scope
 is checked per-route and **only for service principals**: `if (principal.kind === 'service')
 requireScope(principal, …)`. A user token is authorised by **ownership** instead — `ownedToken()`
-looks the row up by owner subject, or by id if the principal is an `admin` (`src/server.ts:708-720`).
+looks the row up by owner subject, or by id if the principal is an `admin` (`src/server.ts`).
 
 | Method | Path | Who | Idempotency-Key | What it does |
 | --- | --- | --- | --- | --- |
-| `GET` | `/livez` | **no auth** | — | liveness (`src/server.ts:348`) |
-| `GET` | `/readyz` | **no auth** | — | 200/503 (`src/server.ts:350`) |
-| `GET` | `/metrics` | **no auth** | — | Prometheus text (`src/server.ts:358`) |
-| `GET` | `/v1/catalogue` | **no auth** | — | price, network and the three variants. **Public deliberately**: a catalogue behind a token cannot be browsed (`src/server.ts:374`, reasoning at `:373`) |
-| `POST` | `/v1/tokens` | user, or service with `mint:write` | **none — see below** | opens an order. **Nothing is charged and nothing is deployed**, and **an order that could not be built is refused here** (`src/server.ts:400`, scope at `:402`, gate at `:439`) |
-| `GET` | `/v1/tokens` | user, or service with `mint:read` | — | the caller's orders. An `admin` may name another subject (`src/server.ts:468`, `:472`) |
-| `GET` | `/v1/tokens/:id` | owner or admin | — | the order, plus **every deploy attempt**, so "what happened" is answered from the row rather than a log search (`src/server.ts:481`, `:485`) |
-| `POST` | `/v1/tokens/:id/pay` | owner, or service with `mint:write` | **none** | debits Shards and moves the order to `paid`. **One transaction: the ledger entry and the state change together.** 201 fresh, **200 on a replay**, so a client can tell whether its retry did the work (`src/server.ts:505`, status at `:527`) |
-| `POST` | `/v1/tokens/:id/deploy` | owner, or service with `mint:write` | **none** | **202 + `Location`.** Enqueues `token.deploy`. The mainnet allowlist is checked **here, before anything is queued**, so a refusal costs a request rather than a job that dead-letters somewhere an operator has to go and read (`src/server.ts:542`, allowlist at `:562`) |
-| `PUT` | `/v1/tokens/:id/page` | owner, or service with `mint:write` | — | upserts the editorial half of the project page (`src/server.ts:597`) |
-| `GET` | `/v1/tokens/:id/page` | **no auth** | — | renders the page: editorial fields from this database, **on-chain facts from the indexer** (`src/server.ts:623`) |
-| `POST` | `/v1/events` | **HMAC, not a token** | — | the inbound event webhook. Subscribes to **`identity.user.deleted`** and erases (`src/server.ts:644`, decision table in `src/erasure.ts`). Signature checked over the **raw bytes before anything is parsed**; a bad one is **403, never 401** — the MAC is the credential, and a 401 invites the caller to go and find a token. An unsubscribed topic is **202 ignored**, because a 4xx makes the producer's relay retry the same event for ever |
+| `GET` | `/livez` | **no auth** | — | liveness (`src/server.ts`) |
+| `GET` | `/readyz` | **no auth** | — | 200/503 (`src/server.ts`) |
+| `GET` | `/metrics` | **no auth** | — | Prometheus text (`src/server.ts`) |
+| `GET` | `/v1/catalogue` | **no auth** | — | price, network and the three variants. **Public deliberately**: a catalogue behind a token cannot be browsed (`src/server.ts`, reasoning) |
+| `POST` | `/v1/tokens` | user, or service with `mint:write` | **none — see below** | opens an order. **Nothing is charged and nothing is deployed**, and **an order that could not be built is refused here** (`src/server.ts`, scope, gate) |
+| `GET` | `/v1/tokens` | user, or service with `mint:read` | — | the caller's orders. An `admin` may name another subject (`src/server.ts`) |
+| `GET` | `/v1/tokens/:id` | owner or admin | — | the order, plus **every deploy attempt**, so "what happened" is answered from the row rather than a log search (`src/server.ts`) |
+| `POST` | `/v1/tokens/:id/pay` | owner, or service with `mint:write` | **none** | debits Shards and moves the order to `paid`. **One transaction: the ledger entry and the state change together.** 201 fresh, **200 on a replay**, so a client can tell whether its retry did the work (`src/server.ts`, status) |
+| `POST` | `/v1/tokens/:id/deploy` | owner, or service with `mint:write` | **none** | **202 + `Location`.** Enqueues `token.deploy`. The mainnet allowlist is checked **here, before anything is queued**, so a refusal costs a request rather than a job that dead-letters somewhere an operator has to go and read (`src/server.ts`, allowlist) |
+| `PUT` | `/v1/tokens/:id/page` | owner, or service with `mint:write` | — | upserts the editorial half of the project page (`src/server.ts`) |
+| `GET` | `/v1/tokens/:id/page` | **no auth** | — | renders the page: editorial fields from this database, **on-chain facts from the indexer** (`src/server.ts`) |
+| `POST` | `/v1/events` | **HMAC, not a token** | — | the inbound event webhook. Subscribes to **`identity.user.deleted`** and erases (`src/server.ts`, decision table in `src/erasure.ts`). Signature checked over the **raw bytes before anything is parsed**; a bad one is **403, never 401** — the MAC is the credential, and a 401 invites the caller to go and find a token. An unsubscribed topic is **202 ignored**, because a 4xx makes the producer's relay retry the same event for ever |
 
 **Four routes make no `authenticate()` call**: `/livez`, `/readyz`, `/metrics` and
 `/v1/catalogue` — plus `GET /v1/tokens/:id/page`, which is a public page by design
-(`src/server.ts:623`), and `POST /v1/events`, which authenticates a **delivery** rather than a
+(`src/server.ts`), and `POST /v1/events`, which authenticates a **delivery** rather than a
 principal.
 
 ### Right to erasure
@@ -104,31 +104,31 @@ erased owner back into a person.
 
 "Does not exist" and "is not yours" are **the same 404** on purpose: a distinct 403 for the second
 is an oracle that lets an unauthorised caller enumerate which order ids exist
-(`src/server.ts:696-697`).
+(`src/server.ts`).
 
 Amounts cross the wire as **strings** — a supply of 10²⁴ is an ordinary token and does not survive a
-JSON number (`src/server.ts:732`).
+JSON number (`src/server.ts`).
 
 ### An order that cannot be built is refused before it can be paid for
 
-`POST /v1/tokens` calls `assertBuildable` (`src/catalogue.ts:179`, called at `src/server.ts:412`).
+`POST /v1/tokens` calls `assertBuildable` (`src/catalogue.ts`, called at `src/server.ts`).
 It answers **400 `unbuildable_order`** with a `field` — `cap` or `features` — in the error body
-(`src/server.ts:299`), which is deliberately **not** the generic `bad_request` every other 400 uses:
+(`src/server.ts`), which is deliberately **not** the generic `bad_request` every other 400 uses:
 a caller reading `unbuildable_order` knows the order can never succeed as written and knows which
 input to change.
 
 **It was `variantFor(features)` alone, and `variantFor` never reads the cap.** The cap rule ran for
-the first time in `constructorArgs` (`src/catalogue.ts:138-148`), which runs inside the deploy job
-(`src/families.ts:336-348`) — after `POST /v1/tokens/:id/pay` has debited the customer. So a foundry
+the first time in `constructorArgs` (`src/catalogue.ts`), which runs inside the deploy job
+(`src/families.ts`) — after `POST /v1/tokens/:id/pay` has debited the customer. So a foundry
 order with no cap, or with a cap below its own initial supply, was **accepted, charged, and then
 unbuildable**. It did not even fail cleanly: the error matches none of `driveDeploy`'s four
-classified failures (`src/deploy.ts:118-169`), so the lease was released and the row stayed
-`deploying` — which is in `CLAIMABLE` (`src/tokens.ts:68-73`), so the sweep put it straight back on
+classified failures (`src/deploy.ts`), so the lease was released and the row stayed
+`deploying` — which is in `CLAIMABLE` (`src/tokens.ts`), so the sweep put it straight back on
 the queue on the next tick, for ever, with the money gone and no state a customer is ever shown.
 
 **Two of the three cap failures were reachable, and it is worth being exact about which.** The
 database already refuses a cap below the supply — `constraint tokens_cap_covers_supply check (cap is
-null or cap >= supply)` (`src/migrations.ts:176`) — so that case was a **500 at the order**, ugly but
+null or cap >= supply)` (`src/migrations.ts`) — so that case was a **500 at the order**, ugly but
 not a charge. The two that got through the insert were the ones the constraint cannot see: a capped
 variant with **no** cap (`cap is null` satisfies the check) and an uncapped variant with a cap
 (`cap >= supply` satisfies it). Both were accepted 201 and payable. Measured by mutating the gate
@@ -157,40 +157,40 @@ The two routes where a duplicate would cost money are protected by other means, 
 being precise about which:
 
 * `POST /pay` is a conditional state transition — an order already `paid` cannot be paid again, and
-  the ledger entry and the state change commit together (`src/server.ts:478`). The replay answers
+  the ledger entry and the state change commit together (`src/server.ts`). The replay answers
   200 rather than double-debiting.
 * `POST /deploy` enqueues with `onConflict: 'keep'`, so **three clicks before the first job runs
-  produce one run** (`src/server.ts:547-552`), and `claimDeploy`'s row-level lease makes two deploys
-  of one token impossible (`src/jobs.ts:20-22`).
+  produce one run** (`src/server.ts`), and `claimDeploy`'s row-level lease makes two deploys
+  of one token impossible (`src/jobs.ts`).
 
 ---
 
 ## Background work
 
 Leased jobs only; CI greps for a `setInterval`. **The lease key names the contended resource**
-(`src/jobs.ts:8-27`).
+(`src/jobs.ts`).
 
 | Job | Lease key | Cadence | What two replicas do |
 | --- | --- | --- | --- |
-| `outbox.relay` | `stream` | 1s | one claims the stream (`src/jobs.ts:78`) |
-| `token.deploy` | `<chain>:<network>` | on demand | **the key is the deployer's nonce sequence, not the token id** — and this is the decision most likely to be got wrong here. Every deploy reads `eth_getTransactionCount` on **its own per-order deployer address**, so two tokens are genuinely independent; but they share one node, one fee quote and one custody rate limit, and serialising them is what keeps a hundred queued orders from opening a hundred concurrent signing calls. The row-level lease inside `claimDeploy` is what makes two deploys of the *same* token impossible; this key bounds the load (`src/jobs.ts:13-22`) |
-| `token.sweep` | `<chain>:<network>` | 15s | finds outstanding deploys and enqueues them. **It shares a key with `token.deploy` and that is safe for exactly one reason: it never signs and never sends** (`src/jobs.ts:23-25`, `:74-77`) |
+| `outbox.relay` | `stream` | 1s | one claims the stream (`src/jobs.ts`) |
+| `token.deploy` | `<chain>:<network>` | on demand | **the key is the deployer's nonce sequence, not the token id** — and this is the decision most likely to be got wrong here. Every deploy reads `eth_getTransactionCount` on **its own per-order deployer address**, so two tokens are genuinely independent; but they share one node, one fee quote and one custody rate limit, and serialising them is what keeps a hundred queued orders from opening a hundred concurrent signing calls. The row-level lease inside `claimDeploy` is what makes two deploys of the *same* token impossible; this key bounds the load (`src/jobs.ts`) |
+| `token.sweep` | `<chain>:<network>` | 15s | finds outstanding deploys and enqueues them. **It shares a key with `token.deploy` and that is safe for exactly one reason: it never signs and never sends** (`src/jobs.ts`) |
 
 **A key is not a lock across kinds.** The jobs table is unique on `(kind, key)`, so
 `token.sweep / eth:testnet` and `token.deploy / eth:testnet` are two rows and two workers may hold
 them at the same instant. That is tolerable only because the sweep claims nothing, signs nothing and
 broadcasts nothing — **the moment anything in `token.sweep` reaches a chain it must be merged into
 `token.deploy` rather than given its own key**, because sharing a key with a different kind buys
-nothing at all (`src/jobs.ts:29-34`).
+nothing at all (`src/jobs.ts`).
 
 The sweep is the thing the frozen service has no equivalent of: there, settlement runs only when a
 request arrives for that order, so a closed tab leaves a broadcast deploy with a live hash that
-nothing ever looks at again (`src/jobs.ts:37-40`). It is seeded **for every chain rather than for
+nothing ever looks at again (`src/jobs.ts`). It is seeded **for every chain rather than for
 every chain with work**, because a job that only exists once there is something to do is a job whose
 absence looks exactly like a job that is stuck, and `jobs_overdue` stops being a signal
-(`src/jobs.ts:67-69`).
+(`src/jobs.ts`).
 
-A dead-lettered recurring job is deliberately not re-armed (`src/jobs.ts:101-103`).
+A dead-lettered recurring job is deliberately not re-armed (`src/jobs.ts`).
 
 ---
 
@@ -201,19 +201,19 @@ A dead-lettered recurring job is deliberately not re-armed (`src/jobs.ts:101-103
 
 | Constraint | Refuses | Why it is here rather than in a handler |
 | --- | --- | --- |
-| `tokens_paid_before_broadcast` — `broadcast_at is null or paid_journal_entry_id is not null` | putting anything on a chain that was not paid for | **money before chain, as a constraint.** A handler-level check holds for the path that went through the handler; this holds for the deploy job, a retry, a repair script and a psql session (`src/migrations.ts:190`) |
-| `tokens_broadcast_has_hash` — `broadcast_at is null or deploy_tx_hash is not null` | a broadcast with no hash | **this is the Solana defect expressed as a constraint.** The frozen call site has no `onBroadcast`, so a lost confirmation race writes failure with a null hash and the next claim mints again — paying gas twice and orphaning a live contract. Here that row cannot be written (`src/migrations.ts:181`, reasoning at `:177-180`) |
-| `tokens_deploy_tx_hash_uniq`, a **partial** unique index `where deploy_tx_hash is not null` | two tokens claiming one transaction | if two rows ever claim one deploy the second write **fails rather than quietly overwriting the evidence of the first** (`src/migrations.ts:195`, reasoning at `:192-193`). Partial because most rows have no hash yet, and a full unique index would refuse the second draft |
-| `tokens_terminal_is_complete` | `deployed` without a contract address and hash, or `failed` without a reason | **a terminal state that says nothing is a terminal state nobody can act on** (`src/migrations.ts:184-187`) |
-| `tokens_cap_covers_supply` — `cap is null or cap >= supply` | an order that is unsatisfiable at birth | it would otherwise be discovered by the constructor reverting, after the customer has paid (`src/migrations.ts:176`) |
-| `tokens_supply_positive`, `tokens_decimals_sane` (0–36) | a zero-supply token, an absurd decimals | (`src/migrations.ts:175`, `:174`) |
-| `tokens_status_known`, `tokens_network_known` | a state or network nobody enumerated | a status that exists in the data and in no report (`src/migrations.ts:169`, `:173`) |
-| `token_deploy_attempts_uniq (token_id, attempt, outcome)` | a duplicated attempt record | the table is **append-only, every attempt including the ones that broadcast and then lost their confirmation** — without it a re-claim has no way to know a previous attempt put bytes on a wire (`src/migrations.ts:220`, reasoning at `:204-207`) |
-| `project_pages_token_uniq` | two pages for one token | (`src/migrations.ts:248`) |
-| `project_pages` has **no** supply / authority / address column | — | deliberate absence, and the most important line in that migration: those are read from the indexer at render time, because a copy here is the order's intent presented as on-chain reality (`src/migrations.ts:229-232`) |
+| `tokens_paid_before_broadcast` — `broadcast_at is null or paid_journal_entry_id is not null` | putting anything on a chain that was not paid for | **money before chain, as a constraint.** A handler-level check holds for the path that went through the handler; this holds for the deploy job, a retry, a repair script and a psql session (`src/migrations.ts`) |
+| `tokens_broadcast_has_hash` — `broadcast_at is null or deploy_tx_hash is not null` | a broadcast with no hash | **this is the Solana defect expressed as a constraint.** The frozen call site has no `onBroadcast`, so a lost confirmation race writes failure with a null hash and the next claim mints again — paying gas twice and orphaning a live contract. Here that row cannot be written (`src/migrations.ts`, reasoning) |
+| `tokens_deploy_tx_hash_uniq`, a **partial** unique index `where deploy_tx_hash is not null` | two tokens claiming one transaction | if two rows ever claim one deploy the second write **fails rather than quietly overwriting the evidence of the first** (`src/migrations.ts`, reasoning). Partial because most rows have no hash yet, and a full unique index would refuse the second draft |
+| `tokens_terminal_is_complete` | `deployed` without a contract address and hash, or `failed` without a reason | **a terminal state that says nothing is a terminal state nobody can act on** (`src/migrations.ts`) |
+| `tokens_cap_covers_supply` — `cap is null or cap >= supply` | an order that is unsatisfiable at birth | it would otherwise be discovered by the constructor reverting, after the customer has paid (`src/migrations.ts`) |
+| `tokens_supply_positive`, `tokens_decimals_sane` (0–36) | a zero-supply token, an absurd decimals | (`src/migrations.ts`) |
+| `tokens_status_known`, `tokens_network_known` | a state or network nobody enumerated | a status that exists in the data and in no report (`src/migrations.ts`) |
+| `token_deploy_attempts_uniq (token_id, attempt, outcome)` | a duplicated attempt record | the table is **append-only, every attempt including the ones that broadcast and then lost their confirmation** — without it a re-claim has no way to know a previous attempt put bytes on a wire (`src/migrations.ts`, reasoning) |
+| `project_pages_token_uniq` | two pages for one token | (`src/migrations.ts`) |
+| `project_pages` has **no** supply / authority / address column | — | deliberate absence, and the most important line in that migration: those are read from the indexer at render time, because a copy here is the order's intent presented as on-chain reality (`src/migrations.ts`) |
 
 `tokens_claimable_idx` is partial on the four in-flight statuses — the claim query's access path,
-"work that is due, oldest first" (`src/migrations.ts:201-203`).
+"work that is due, oldest first" (`src/migrations.ts`).
 
 ---
 
@@ -225,7 +225,7 @@ and `MINT_IDENTITY_CREDENTIAL` ship **empty**, so a copied file refuses to boot 
 filled.
 
 **`MINT_SERVICE_TOKEN` is retired.** It was a service *token*, and a service token expires in 600
-seconds (`identity/src/tokens.ts:28`). This service read one once at boot and nothing re-minted it,
+seconds (`identity/src/tokens.ts`). This service read one once at boot and nothing re-minted it,
 so ten minutes into every deployment custody, the indexer and the ledger refused every call — and
 `custody:sign:deployer` is how a contract gets deployed, so the symptom looked like custody being
 broken rather than like this service holding a corpse. What a container holds at rest is now a
@@ -235,33 +235,33 @@ token whenever one is needed. Setting the old variable is logged as ignored at b
 
 | Variable | Default | If it is wrong or missing |
 | --- | --- | --- |
-| `PORT` | `4000` | integer 1–65535 (`src/env.ts:251`) |
-| `NODE_ENV` | `development` | labelling only (`src/env.ts:252`) |
-| `LOG_LEVEL` | `info` | outside the four levels, boot fails (`src/env.ts:233`) |
-| `CLOUDSFORGE_TAG` | `dev` | the reported version is wrong (`src/env.ts:253`) |
-| `MINT_DATABASE_URL` | — | **required** (`src/env.ts:255`). Rule 1 |
-| `MINT_DATABASE_POOL_MAX` | `10` | 1–100 (`src/env.ts:258`) |
-| `IDENTITY_JWKS_URL` | — | **required**; unreachable → 503, never 401 (`src/env.ts:259`) |
-| `IDENTITY_ISSUER` | — | **required**; wrong → universal 401 (`src/env.ts:260`) |
-| `OUTBOX_SIGNING_SECRET` | — | **required, ≥24 chars, placeholders refused** (`src/env.ts:261`) |
-| `INSTANCE_ID` | hostname | names this replica in `jobs.locked_by` (`src/env.ts:262`) |
-| `CUSTODY_URL` | — | **required**. No signature, no deploy (`src/env.ts:264`) |
-| `INDEXER_URL` | — | **required** (`src/env.ts:265`) |
-| `LEDGER_URL` | — | **required**. No debit, no order (`src/env.ts:266`) |
+| `PORT` | `4000` | integer 1–65535 (`src/env.ts`) |
+| `NODE_ENV` | `development` | labelling only (`src/env.ts`) |
+| `LOG_LEVEL` | `info` | outside the four levels, boot fails (`src/env.ts`) |
+| `CLOUDSFORGE_TAG` | `dev` | the reported version is wrong (`src/env.ts`) |
+| `MINT_DATABASE_URL` | — | **required** (`src/env.ts`). Rule 1 |
+| `MINT_DATABASE_POOL_MAX` | `10` | 1–100 (`src/env.ts`) |
+| `IDENTITY_JWKS_URL` | — | **required**; unreachable → 503, never 401 (`src/env.ts`) |
+| `IDENTITY_ISSUER` | — | **required**; wrong → universal 401 (`src/env.ts`) |
+| `OUTBOX_SIGNING_SECRET` | — | **required, ≥24 chars, placeholders refused** (`src/env.ts`) |
+| `INSTANCE_ID` | hostname | names this replica in `jobs.locked_by` (`src/env.ts`) |
+| `CUSTODY_URL` | — | **required**. No signature, no deploy (`src/env.ts`) |
+| `INDEXER_URL` | — | **required** (`src/env.ts`) |
+| `LEDGER_URL` | — | **required**. No debit, no order (`src/env.ts`) |
 | `PRICING_URL` | — | **required**. The USD→EMBER rate board. No rate, no payment — fail closed rather than guess how much of a customer's money to take (`src/pricingclient.ts`) |
 | `MINT_IDENTITY_CREDENTIAL` | — | **≥24 chars, `cfsc_…`.** The long-lived credential exchanged at `POST /service-tokens/exchange` for a ten-minute token — **not shared**, SD-05. Technically optional so the image can boot for CI's `/livez` smoke test, but `/readyz` fails hard without it and every peer call 503s |
 | `IDENTITY_URL` | `IDENTITY_ISSUER` | where the credential is exchanged. Only set it where the issuer and the dialled address genuinely differ |
 | `MINT_SERVICE_TOKEN` | — | **retired.** A 600-second token read once at boot. If still set, boot logs that it is ignored |
-| `MINT_UPSTREAM_DEADLINE_MS` | `5000` | 100–60000 (`src/env.ts:268`) |
-| `MINT_RPC_URLS` | `{}` | `chain → JSON-RPC endpoint` as JSON. **Empty means a chain with no endpoint refuses rather than falling back to a public node nobody chose** (`src/env.ts:270`, `:179-182`). A malformed value is refused at boot, because a silently-empty map is an outage that presents as "every deploy on every chain is refused for want of an endpoint" — a long way from the typo that caused it (`src/env.ts:112-117`) |
-| `MINT_RPC_DEADLINE_MS` | `5000` | 100–60000 (`src/env.ts:271`) |
-| `MINT_NETWORK` | `testnet` | **the one network this deployment mints on.** A single value rather than a free per-request parameter, because a service that can be asked for either is **one bad request away from putting a customer's contract on a mainnet they did not pay for** (`src/env.ts:272`, reasoning at `:186-193`) |
-| `MINT_DEPLOYS_ENABLED` | `true` | set `false` to stop deploying **without stopping the service**, so orders still take payment (`src/env.ts:274`, `:196`) |
-| `MINT_MAINNET_ALLOWLIST` | `` (nobody) | subjects permitted to deploy to a mainnet. **Empty means nobody, and that is the fail-closed default the frozen service does not have** — it gates mainnet on nothing at all (`src/env.ts:275`, reasoning at `:198-201` and `src/server.ts:94-99`) |
-| `MINT_MIN_GAS_PRICE_WEI` | `1000000000` | parsed as **wei with `BigInt`, never `Number`**: one EMBER is 1e18 wei, four orders of magnitude past what a double holds exactly, and a rounded bound is a bound that does not hold at the value it was written for (`src/env.ts:237`, reasoning at `:100-104`) |
-| `MINT_MAX_GAS_PRICE_WEI` | `500000000000` | must be ≥ the minimum, or boot fails (`src/env.ts:238-241`) |
-| `MINT_MAX_FEE_WEI` | `1e18` | the most one deploy may cost in gas. Custody enforces its own ceiling at 2e18 (`src/env.ts:279`, `:206`) |
-| `MINT_STUCK_MINUTES` | `30` | how long a deploy may sit unconfirmed before it is called stuck. **Above one confirmation window on every chain the estate deploys to, so a slow block is not an incident.** The frozen service had 180 *seconds*, and it was a request timeout rather than a stuck deadline (`src/env.ts:283`, reasoning at `:280-282`) |
+| `MINT_UPSTREAM_DEADLINE_MS` | `5000` | 100–60000 (`src/env.ts`) |
+| `MINT_RPC_URLS` | `{}` | `chain → JSON-RPC endpoint` as JSON. **Empty means a chain with no endpoint refuses rather than falling back to a public node nobody chose** (`src/env.ts`). A malformed value is refused at boot, because a silently-empty map is an outage that presents as "every deploy on every chain is refused for want of an endpoint" — a long way from the typo that caused it (`src/env.ts`) |
+| `MINT_RPC_DEADLINE_MS` | `5000` | 100–60000 (`src/env.ts`) |
+| `MINT_NETWORK` | `testnet` | **the one network this deployment mints on.** A single value rather than a free per-request parameter, because a service that can be asked for either is **one bad request away from putting a customer's contract on a mainnet they did not pay for** (`src/env.ts`, reasoning) |
+| `MINT_DEPLOYS_ENABLED` | `true` | set `false` to stop deploying **without stopping the service**, so orders still take payment (`src/env.ts`) |
+| `MINT_MAINNET_ALLOWLIST` | `` (nobody) | subjects permitted to deploy to a mainnet. **Empty means nobody, and that is the fail-closed default the frozen service does not have** — it gates mainnet on nothing at all (`src/env.ts`, reasoning and `src/server.ts`) |
+| `MINT_MIN_GAS_PRICE_WEI` | `1000000000` | parsed as **wei with `BigInt`, never `Number`**: one EMBER is 1e18 wei, four orders of magnitude past what a double holds exactly, and a rounded bound is a bound that does not hold at the value it was written for (`src/env.ts`, reasoning) |
+| `MINT_MAX_GAS_PRICE_WEI` | `500000000000` | must be ≥ the minimum, or boot fails (`src/env.ts`) |
+| `MINT_MAX_FEE_WEI` | `1e18` | the most one deploy may cost in gas. Custody enforces its own ceiling at 2e18 (`src/env.ts`) |
+| `MINT_STUCK_MINUTES` | `30` | how long a deploy may sit unconfirmed before it is called stuck. **Above one confirmation window on every chain the estate deploys to, so a slow block is not an incident.** The frozen service had 180 *seconds*, and it was a request timeout rather than a stuck deadline (`src/env.ts`, reasoning) |
 | `MINT_DEPLOY_PRICE_USD_CENTS` | `2500` | **must be positive.** A zero price is a free deploy, which is a free gas bill paid by the platform for anyone who can open an order — refused rather than defaulted back, because the value was stated. Replaces `MINT_DEPLOY_PRICE_SHARDS`, which is now **refused at boot**: one Shard was exactly one cent, so the same number is the same price, but a deployment that still names the retired unit is stating a price in something the estate no longer issues and must be told rather than silently corrected (`src/env.ts`) |
 
 ---
@@ -270,15 +270,15 @@ token whenever one is needed. Setting the old variable is logged as ignored at b
 
 | Upstream | Routes called | Verified against | When it is down |
 | --- | --- | --- | --- |
-| `micro-ledger` | `POST /entries` (`src/ledgerclient.ts:148`) | `ledger/src/server.ts:346` ✅ | **fail closed.** No debit, no order state change — they commit together, so a ledger outage means `POST /pay` fails and nothing half-happens |
-| `micro-custody` | `POST /v1/sign` (`src/custodyclient.ts:148`), `POST /v1/addresses` (`src/custodyclient.ts:173`) | `custody/src/server.ts:424`, `:320` ✅ | **fail closed.** No signature, no bytes; the job retries under its lease. `/v1/sign` takes **seven** identity fields — address, chain, network, family, purpose, plus the payload — so a signature cannot be requested for a key the caller has misidentified (`src/custodyclient.ts:20`) |
-| `micro-indexer` | `GET /v1/transactions/:chain/:network/:hash` (`src/indexerclient.ts:196`), `GET /v1/tokens/:chain/:network/:address` (`src/indexerclient.ts:212`) | `indexer/src/server.ts:157`, `:159` ✅ | **fail open, but only for the 404 that is an answer.** `transaction_not_found` and `token_not_found` are the indexer's statements about a chain and become `null`; **any other 404 throws `IndexerRouteError`** (`src/indexerclient.ts:205`, `:223`), because a path this service asked for and the indexer does not serve says nothing about anybody's chain |
+| `micro-ledger` | `POST /entries` (`src/ledgerclient.ts`) | `ledger/src/server.ts` ✅ | **fail closed.** No debit, no order state change — they commit together, so a ledger outage means `POST /pay` fails and nothing half-happens |
+| `micro-custody` | `POST /v1/sign` (`src/custodyclient.ts`), `POST /v1/addresses` (`src/custodyclient.ts`) | `custody/src/server.ts` ✅ | **fail closed.** No signature, no bytes; the job retries under its lease. `/v1/sign` takes **seven** identity fields — address, chain, network, family, purpose, plus the payload — so a signature cannot be requested for a key the caller has misidentified (`src/custodyclient.ts`) |
+| `micro-indexer` | `GET /v1/transactions/:chain/:network/:hash` (`src/indexerclient.ts`), `GET /v1/tokens/:chain/:network/:address` (`src/indexerclient.ts`) | `indexer/src/server.ts` ✅ | **fail open, but only for the 404 that is an answer.** `transaction_not_found` and `token_not_found` are the indexer's statements about a chain and become `null`; **any other 404 throws `IndexerRouteError`** (`src/indexerclient.ts`), because a path this service asked for and the indexer does not serve says nothing about anybody's chain |
 
 The rule in `deploy.ts` is: **the indexer when it has the transaction, the node when it does not, and
-neither is allowed to be silently absent** (`src/indexerclient.ts:12-13`). The indexer being a
+neither is allowed to be silently absent** (`src/indexerclient.ts`). The indexer being a
 *follower* is why: a creation broadcast four seconds ago is not in it yet, and "the indexer has never
 heard of this hash" is emphatically not "the chain does not have it". Reading that absence as a
-failure would mark every fresh broadcast lost and re-deploy it (`src/indexerclient.ts:8-12`).
+failure would mark every fresh broadcast lost and re-deploy it (`src/indexerclient.ts`).
 
 **Both paths were wrong until this change, and neither failure had a symptom.** `transaction()`
 asked for `/v1/chains/:chain/:network/transactions/:hash` — the *status* route's shape with a
@@ -290,7 +290,7 @@ reach a route.
 
 Two things stop the next one. At runtime the 404 splits, above. Before that, in CI, the
 `indexer-routes` job checks `micro-indexer` out and runs `scripts/checkindexerroutes.mjs`, which
-parses the route table out of `indexer/src/server.ts:153-163` and fails if any path this client
+parses the route table out of `indexer/src/server.ts` and fails if any path this client
 requests is not one of them (`.github/workflows/ci.yml`). It compares **whole path shapes, not
 prefixes**: the dead path began `/v1/chains/`, which is a prefix the indexer really does serve, so a
 prefix check would have passed it. The job then mutates both sides and requires the check to go red,
@@ -298,7 +298,7 @@ because a job that grades a file it failed to fetch looks exactly like a job tha
 
 `confirmations: null` from the indexer is **not zero** — it means the indexer knows the transaction
 but cannot currently say how deep it is, which happens while a tip is being re-read after a reorg. A
-caller that read null as zero would treat a confirmed deploy as fresh (`src/indexerclient.ts:126-128`).
+caller that read null as zero would treat a confirmed deploy as fresh (`src/indexerclient.ts`).
 
 ---
 
@@ -324,7 +324,7 @@ MINT_TEST_DATABASE_URL=postgres://mint:mint@127.0.0.1:55435/mint_test pnpm test
 ```
 
 **125 `test(` declarations**, `node:test` only, which run as **129 cases**: two of the declarations
-are inside a loop over the three token variants (`src/unit.test.ts:334`, `:354`), so each produces
+are inside a loop over the three token variants (`src/unit.test.ts`), so each produces
 three. The upstreams are faked at the client interface —
 there is no live chain in the suite — so what the tests prove is the state machine, the constraints
 and the crash-resumption points, not that the estate's other services answer as this service expects.
@@ -343,11 +343,11 @@ the committed-bytecode reproduction, the estate rules, and `indexer-routes` — 
 * **A token observation costs the indexer up to nine RPC calls, and nothing here caches it.**
   `GET /v1/tokens/…` makes the indexer read the contract's state at its canonical head — a block
   identity check, `eth_getCode`, and one `eth_call` per field. A project page is rendered on every
-  request (`src/server.ts:596`), so a hot page is that traffic multiplied. Nothing has fallen over
+  request (`src/server.ts`), so a hot page is that traffic multiplied. Nothing has fallen over
   and no measurement exists; recorded here rather than pre-optimised, and the fix if it bites is a
   short-lived cache in the indexer, where the observation's block identity already lives.
 * **`families.ts` still degrades to the node when the indexer answers badly.** The catch is narrowed
-  to `IndexerUnavailableError` now rather than swallowing every throwable (`src/families.ts:265-270`),
+  to `IndexerUnavailableError` now rather than swallowing every throwable (`src/families.ts`),
   but `IndexerRouteError` is a subclass, so a wrong route on the deploy path still degrades silently
   to `eth_getTransactionReceipt` instead of failing. That is deliberate — refusing a customer's
   deploy over an integration bug is worse than deploying from the node's own receipt — and it is why
@@ -355,26 +355,26 @@ the committed-bytecode reproduction, the estate rules, and `indexer-routes` — 
 * **No route-level idempotency** — no helper, no table, no header. A retried `POST /v1/tokens`
   creates a second draft order. Recorded and deliberately unfixed at
   `docs/ecosystem/18-build-status.md` §3.3d.
-* **`/metrics` is unauthenticated** (`src/server.ts:338`).
-* **A failed deploy is not retried automatically** (`src/server.ts:523-525`). The order is terminal and
+* **`/metrics` is unauthenticated** (`src/server.ts`).
+* **A failed deploy is not retried automatically** (`src/server.ts`). The order is terminal and
   needs an operator; `token_deploy_attempts` holds every attempt so the decision can be made from
   the row.
 * **No OpenAPI description**, estate-wide (`docs/ecosystem/18-build-status.md` §3.3d, item 1).
 * **An unclassified throw on the deploy path is a loop, not a failure.** `driveDeploy` classifies
   four error types and everything else falls through to `releaseLease` + rethrow
-  (`src/deploy.ts:118-169`), leaving the row in `deploying` — which is in `CLAIMABLE`
-  (`src/tokens.ts:68-73`), so `token.sweep` re-enqueues it on the next tick, indefinitely, with
-  `deploy_attempts` climbing and no cap on it (`src/tokens.ts:386`). This is how the unbuildable-cap
+  (`src/deploy.ts`), leaving the row in `deploying` — which is in `CLAIMABLE`
+  (`src/tokens.ts`), so `token.sweep` re-enqueues it on the next tick, indefinitely, with
+  `deploy_attempts` climbing and no cap on it (`src/tokens.ts`). This is how the unbuildable-cap
   defect above actually manifested, and closing that defect at the order route does **not** close
   this: it removes the only known way to reach it, not the mechanism. Left as it is deliberately —
   the alternative is failing a row terminally on an error nobody has classified, which is exactly
-  what `CLAIMABLE`'s exclusion of `failed` exists to prevent (`src/tokens.ts:60-73`). What is
+  what `CLAIMABLE`'s exclusion of `failed` exists to prevent (`src/tokens.ts`). What is
   missing is an alarm: `mint_deploys_outstanding` is sampled by the sweep
-  (`src/jobs.ts:200`) and a row stuck in it forever is visible there, unaliased.
+  (`src/jobs.ts`) and a row stuck in it forever is visible there, unaliased.
 * **No already-stored order can be in the unbuildable state, and this was checked rather than
   assumed.** `micro-mint` has never run against a persistent database: the only environment that
   exists is `deploy/compose/docker-compose.slice.yml`, which brings up identity and ledger and
-  nothing else, and `docs/ecosystem/18-build-status.md:47-52` states that no environment exists
+  nothing else, and `docs/ecosystem/18-build-status.md` states that no environment exists
   beyond it. So there is no store to migrate and none has been touched. For the day there is one,
   the read-only query that finds them is:
 

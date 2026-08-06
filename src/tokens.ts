@@ -330,15 +330,15 @@ export const BROADCAST_TOPIC = 'mint.token.broadcast'
  * The evidence that it is a rename and not a missing emit is that the two are the same fact, and
  * that nothing anywhere reads the name this service used. `grep -rn 'mint.token.deployed'` across
  * all 58 repositories returns this declaration, this repository's own tests, and one unrelated
- * fixture in `community/src/server.test.ts:632` that uses it as an example of a topic community does
+ * fixture in `community/src/server.test.ts` that uses it as an example of a topic community does
  * NOT subscribe to. Nobody was listening. Meanwhile the registered name is read in four places:
  *
- *   - `notify/src/catalogue.ts:568` — priority HIGH, template `token.deployed`, and its own `why`
+ *   - `notify/src/catalogue.ts` — priority HIGH, template `token.deployed`, and its own `why`
  *     says it "is the event that retires ForgeMint's four-second client poll".
- *   - `activity/src/classify.ts:838` — `token.deploy_confirmed`, user-visible.
- *   - `analytics/src/catalogue.ts:321` — `token_deployed`, personal, feeding metrics 8 and 9
- *     (`docs/ecosystem/13-operational-model.md:623`, token creation and its funnel).
- *   - `docs/ecosystem/07-dependency-map.md:176` and `02-target-architecture.md:704` both list
+ *   - `activity/src/classify.ts` — `token.deploy_confirmed`, user-visible.
+ *   - `analytics/src/catalogue.ts` — `token_deployed`, personal, feeding metrics 8 and 9
+ *     (`docs/ecosystem/13-operational-model.md`, token creation and its funnel).
+ *   - `docs/ecosystem/07-dependency-map.md` and `02-target-architecture.md` both list
  *     activity, market, notify and analytics as consumers.
  *
  * All four were dead code, and the client kept polling every four seconds.
@@ -457,7 +457,7 @@ export async function markPaid(
 /**
  * Take the exclusive right to advance this order's deploy.
  *
- * CARRIED FORWARD from `forge-mint/src/store.ts:164`, which is the one correct distributed
+ * CARRIED FORWARD from `forge-mint/src/store.ts`, which is the one correct distributed
  * primitive in the old estate, with three changes:
  *
  *   1. **`failed` is not claimable.** See the note on `CLAIMABLE`. In the frozen predicate a
@@ -666,11 +666,11 @@ export function deployConfirmedPayload(token: TokenRecord): Record<string, unkno
      * **THE PERSON, WHICH IS A DIFFERENT QUESTION FROM THE NAME.**
      *
      * Renaming the topic is only half the repair. `notify`'s rule for it is `forUser`, and
-     * `userIdOf` (`notify/src/catalogue.ts:120`) looks for a bare uuid under `user_id`/`userId`,
+     * `userIdOf` (`notify/src/catalogue.ts`) looks for a bare uuid under `user_id`/`userId`,
      * then falls back to the envelope key only when the registry keys the topic by `user_id` — this
      * one is keyed by `token_id` — and finally to an actor of `user:<id>`. This emit is reached from
-     * a leased deploy job, so the actor is `service:mint` (`deploy.ts:309`). `activity`'s classifier
-     * reads `userId` as a bare uuid too (`classify.ts:112`).
+     * a leased deploy job, so the actor is `service:mint` (`deploy.ts`). `activity`'s classifier
+     * reads `userId` as a bare uuid too (`classify.ts`).
      *
      * The payload carried `ownerSubject`, which is `user:<uuid>` — a SUBJECT, not a user id — so
      * every reader in the estate would have found nobody and a HIGH-priority notification would have
@@ -691,8 +691,8 @@ export function deployConfirmedPayload(token: TokenRecord): Record<string, unkno
     txHash: token.deployTxHash,
     symbol: token.symbol,
     // Both consumers render a name before falling back to the symbol — `activity`'s summary is
-    // "<name> is live at <address>" (`classify.ts:844`) and notify's `tokenName` tries `token_name`,
-    // `tokenName`, `name`, then `symbol` (`catalogue.ts:576`). The column exists and simply was not
+    // "<name> is live at <address>" (`classify.ts`) and notify's `tokenName` tries `token_name`,
+    // `tokenName`, `name`, then `symbol` (`catalogue.ts`). The column exists and simply was not
     // on the event, so every notification would have read "Your token".
     name: token.name,
   }

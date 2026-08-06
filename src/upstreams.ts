@@ -7,7 +7,7 @@
  * is wiring no test can reach. `index.ts` opens a pool, asserts a schema and calls `listen()`;
  * importing it from a test starts a server. So the line that was wrong —
  *
- *     const token = () => env.serviceToken        // index.ts:92, for months
+ *     const token = () => env.serviceToken        // index.ts, for months
  *
  * — was structurally untestable, and a suite full of tests that build their own clients could not
  * have caught it however carefully they were written. A test that constructs its own provider
@@ -16,7 +16,7 @@
  *
  * ── THE TEN-MINUTE CLIFF ───────────────────────────────────────────────────────────────────────
  *
- * A service token expires in 600 seconds (identity/src/tokens.ts:28). This service read one once
+ * A service token expires in 600 seconds (identity/src/tokens.ts). This service read one once
  * at boot and nothing re-minted it — nothing could, because minting required the `admin` role. Ten
  * minutes into every deployment, custody, the indexer and the ledger began refusing every call,
  * and no test here could see it because a test mints a token and uses it within seconds.
@@ -73,7 +73,7 @@ export interface Upstreams {
   readonly ledger: LedgerClient
   /**
    * The USD→EMBER rate board. **Unauthenticated**, unlike the three above: the rate board is public
-   * in this estate by design (`pricing/src/server.ts:9`), so this client presents no credential and
+   * in this estate by design (`pricing/src/server.ts`), so this client presents no credential and
    * needs no service-token grant. Wiring it to `token` would demand a scope nobody issues.
    */
   readonly pricing: PricingClient

@@ -15,8 +15,8 @@
  *
  *   - **A topic renamed on the wire.** The registry owns `mint.deploy.confirmed`, one of the eight
  *     FIRST topics of 02-target-architecture §5; this service emitted `mint.token.deployed`.
- *     `notify/src/catalogue.ts:568` (priority HIGH), `activity/src/classify.ts:838` and
- *     `analytics/src/catalogue.ts:321` all read the registered name, so all three were dead code and
+ *     `notify/src/catalogue.ts` (priority HIGH), `activity/src/classify.ts` and
+ *     `analytics/src/catalogue.ts` all read the registered name, so all three were dead code and
  *     the ForgeMint client kept polling every four seconds — the exact cost `notify`'s own rule
  *     records as the reason the topic exists. Nothing anywhere read the name this service used.
  *   - **An envelope the contract refuses.** `version` went out as the integer `1` where the contract
@@ -100,7 +100,7 @@ export interface ProposedTopic {
  *   - An emit site whose topic is in neither the registry nor here fails the test.
  *
  * `keyedBy` on each is read off the emit site, never chosen here: all five are keyed by the token id
- * (`tokens.ts:339`, `:395`, `:584`, `:641`), which is what the registry already says for
+ * (`tokens.ts`), which is what the registry already says for
  * `mint.deploy.confirmed` and is therefore the whole family's partition.
  *
  * ## Why these four are PROPOSED rather than deleted
@@ -263,9 +263,9 @@ export function envelopeDefects(envelope: unknown): readonly string[] {
  *
  * Both consumers are modelled because they disagree in a way that matters:
  *
- *   - `activity/src/classify.ts:112` takes ONLY a bare uuid under `userId`. A `user:<uuid>` subject
+ *   - `activity/src/classify.ts` takes ONLY a bare uuid under `userId`. A `user:<uuid>` subject
  *     is not a user id to it.
- *   - `notify/src/catalogue.ts:120` takes `user_id` or `userId`, then falls back to the envelope key
+ *   - `notify/src/catalogue.ts` takes `user_id` or `userId`, then falls back to the envelope key
  *     when the REGISTRY keys the topic by `user_id` — `mint.deploy.confirmed` is keyed by `token_id`,
  *     so that arm never fires here and a token id can never be mistaken for a person — and finally
  *     to an actor of `user:<id>`.

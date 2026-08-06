@@ -5,7 +5,7 @@
  *
  * Both methods asked for paths `micro-indexer` has never served — `token()` for
  * `/v1/chains/:chain/:network/tokens/:address`, which is the STATUS route's shape with a resource
- * bolted on. Every call 404'd; the 404 became `null`; and `projectpages.ts:209` turned that into
+ * bolted on. Every call 404'd; the 404 became `null`; and `projectpages.ts` turned that into
  * "the indexer has not yet indexed this contract" on every ForgeMint project page, permanently and
  * silently. 04-domain-model §5.3 requires those pages to render supply and authorities **from the
  * indexer** — so the invariant was not merely unmet, it was reported as met-but-pending, for ever.
@@ -68,7 +68,7 @@ const notFound = (code: string): unknown => ({ error: { code, message: 'no', req
 
 test('both calls ask for the route the indexer actually serves', async () => {
   // The indexer's convention is the RESOURCE first, then `:chain/:network`, then the key
-  // (`indexer/src/server.ts:153-163`). Asserted on the wire, not on the source.
+  // (`indexer/src/server.ts`). Asserted on the wire, not on the source.
   const transaction = clientWith(200, { hash: HASH, status: 'success' })
   await transaction.client.transaction('ember', 'testnet', HASH)
   assert.deepEqual(transaction.asked, [`/v1/transactions/ember/testnet/${HASH}`])
@@ -177,7 +177,7 @@ test('an observation is passed through as the chain reported it', async () => {
   })
   const observed = await client.token('ember', 'testnet', TOKEN)
   assert.equal(observed?.mintAuthority, false)
-  // A decimal STRING. `BigInt(onchain.totalSupply)` in `projectpages.ts:167` throws on a JSON
+  // A decimal STRING. `BigInt(onchain.totalSupply)` in `projectpages.ts` throws on a JSON
   // number that has already lost its low digits, and a supply that renders wrong is the whole
   // reason this comes from the chain rather than from the order.
   assert.equal(typeof observed?.totalSupply, 'string')

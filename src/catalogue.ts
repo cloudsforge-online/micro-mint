@@ -3,7 +3,7 @@
  *
  * The variant is derived from the FEATURES the customer asked for rather than from an offer id, so
  * the catalogue is a projection of the contracts rather than a second source of truth about them.
- * The frozen service maps offer id → variant with a fall-through default (`erc20.ts:16-20`), which
+ * The frozen service maps offer id → variant with a fall-through default (`erc20.ts`), which
  * means an unknown offer silently deploys the fixed-supply contract — a customer who paid for a
  * mintable token and received one that can never mint again.
  */
@@ -157,11 +157,11 @@ export function constructorArgs(spec: VariantSpec, input: ConstructorInput): rea
  *
  * `POST /v1/tokens` used to call `variantFor` alone, and `variantFor` never reads the cap. The cap
  * rule lived one call further on, inside `constructorArgs`, which runs in the deploy job
- * (`families.ts:336-348`) — long after `POST /v1/tokens/:id/pay` has debited the customer. So an
+ * (`families.ts`) — long after `POST /v1/tokens/:id/pay` has debited the customer. So an
  * order for the foundry variant with no cap was accepted, charged, and then could not be built:
  * `dataFor` threw a `ChainError`, `driveDeploy` matched none of its four classified failures
- * (`deploy.ts:118-169`), released the lease and rethrew, and `outstandingDeploys` — which selects
- * on `CLAIMABLE`, and `deploying` is in it (`tokens.ts:68-73`) — swept the row back onto the queue
+ * (`deploy.ts`), released the lease and rethrew, and `outstandingDeploys` — which selects
+ * on `CLAIMABLE`, and `deploying` is in it (`tokens.ts`) — swept the row back onto the queue
  * on the next tick. Not a terminal failure with a reason on the row: a permanent loop, with the
  * customer's money spent and the order never reaching any state a human is shown.
  *

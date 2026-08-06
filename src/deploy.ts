@@ -10,7 +10,7 @@
  * gas estimate, a 15-second signing call, the broadcast, and then `sent.wait(1, 180_000)` — a wait
  * of up to **three minutes** for a receipt. Three things then go wrong at once:
  *
- *   * **A rolling deploy kills it.** `obs.ts:241-258` calls `process.exit(0)` ten seconds after
+ *   * **A rolling deploy kills it.** `obs.ts` calls `process.exit(0)` ten seconds after
  *     SIGTERM whatever is in flight, so a deploy in its receipt wait has about a 95% chance of
  *     being cut. Where it lands decides the damage, and the bad landing is between the broadcast
  *     and the write that records the hash: a real signed creation is on the wire and the row has
