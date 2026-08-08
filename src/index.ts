@@ -22,6 +22,7 @@ import postgres from 'postgres'
 import { assertSchemaAtLeast, type Sql as DbSql } from '@cloudsforge/db'
 import { JobQueue, JobRunner, type Sql as JobsSql } from '@cloudsforge/jobs'
 import { Verifier, serviceTokenProbe } from '@cloudsforge/auth'
+import { NO_SCOPES_REQUIRED } from '@cloudsforge/contracts-auth'
 import { HttpClient } from '@cloudsforge/http'
 import { Lifecycle, httpProbe, installSignalHandlers, postgresProbe } from '@cloudsforge/lifecycle'
 import { Logger, Metrics, registerHttpMetrics, registerJobMetrics } from '@cloudsforge/telemetry'
@@ -127,6 +128,39 @@ if (env.legacyServiceTokenPresent) {
     hint: 'it was a 600-second token read once at boot; MINT_IDENTITY_CREDENTIAL replaces it',
   })
 }
+
+/**
+ * **None, and no CloudsForge scope could apply to what this file dials.**
+ *
+ * The `HttpClient`s built below are the per-chain JSON-RPC clients, and step 5 above already says
+ * why they are the exception: they are "deliberately NOT given a token: they dial public chain
+ * nodes outside this estate". A `client.request` at :186 goes to a self-hosted node or a
+ * third-party endpoint whose authority, where it has any, is HTTP Basic in the URL or a provider
+ * key in its query string. Nothing there is minted by `micro-identity` and nothing there is
+ * validated against `@cloudsforge/contracts-auth`, so granting mint a scope would not change one
+ * byte that leaves this module.
+ *
+ * Mint's real outbound demands are declared where their call sites are — `./custodyclient.ts`,
+ * `./indexerclient.ts` and `./ledgerclient.ts` — and `buildUpstreams` (:94) hands those clients the
+ * service token. That is the arrangement this estate wants: the scope is named by the module that
+ * can be checked against the route it dials, never by the composition root. See
+ * `tessera/src/upstreams.ts:163`, which declares nothing for exactly that reason.
+ *
+ * It has to be said out loud rather than left silent because `micro-deploy`'s `derive-grants.mjs`
+ * reads any module that builds an `HttpClient` and names a bearer ANYWHERE in the file as one
+ * presenting an estate credential (`NAMES_A_BEARER`, `deploy/scripts/derive-grants.mjs:280`), and
+ * this file logs about `MINT_IDENTITY_CREDENTIAL` and `MINT_SERVICE_TOKEN` a few lines up. The test
+ * is deliberately loose and should stay that way: narrowing it to the constructor call once missed
+ * `admin-api/src/upstreams.ts`, which attaches its bearer sixteen lines later, and a false negative
+ * there produces NO grant at all rather than a wrong one.
+ *
+ * Until now the answer was written down in someone else's repository: `micro-deploy` carried a
+ * hand-written entry for this file in `compose/estate/grant-gaps.json` reading `"scopes": []` and
+ * quoting :93 back at us. That is a copy of a fact that lives here, and copies rot — the entry is
+ * deleted in the same window as this line lands. `indexer/src/rpc.ts:162` reached the same verdict
+ * about the same kind of peer, and cites this file when it does.
+ */
+export const RPC_SCOPES = NO_SCOPES_REQUIRED
 
 /**
  * One JSON-RPC client per chain, built once so a circuit breaker accumulates state across ticks.
