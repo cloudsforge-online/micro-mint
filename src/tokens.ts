@@ -637,10 +637,13 @@ export function fundingRequestedPayload(
     deployerAddress: token.deployerAddress,
     requiredWei: measured.required.toString(),
     balanceWei: measured.balance.toString(),
-    // What is being ASKED for, which is the requirement plus headroom less the balance — not
-    // `required - balance`. Settlement transfers this figure and does not recompute it: it has no
-    // gas estimate for a creation it is not building.
-    shortfallWei: (token.fundingRequestedWei ?? 0n).toString(),
+    // What is being ASKED for, which is the requirement plus headroom less the balance — NOT
+    // `required - balance`, and named `amountWei` for exactly that reason. It was `shortfallWei`
+    // for one afternoon and that name was a trap: settlement sends this figure verbatim and cannot
+    // recompute it — it has no gas estimate for a creation it is not building — so a field whose
+    // name says "shortfall" and whose value is 1.5× one is a wrong number waiting to be reasoned
+    // about by its label.
+    amountWei: (token.fundingRequestedWei ?? 0n).toString(),
     attempt: token.fundingRequests,
   }
 }

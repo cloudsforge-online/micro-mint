@@ -376,7 +376,7 @@ test('an unfunded deployer ASKS for gas, on the registered topic', { skip }, asy
   assert.equal(payload['attempt'], 1, 'the first ask is attempt 1; settlement keys its transfer on it')
   // Decimal strings, never JSON numbers: a wei quantity above 2^53 is silently rounded, and
   // settlement's parser refuses anything that is not /^\d+$/ rather than coercing it.
-  for (const field of ['requiredWei', 'balanceWei', 'shortfallWei']) {
+  for (const field of ['requiredWei', 'balanceWei', 'amountWei']) {
     assert.equal(typeof payload[field], 'string', `${field} must be a decimal string`)
     assert.match(String(payload[field]), /^\d+$/)
   }
@@ -384,8 +384,8 @@ test('an unfunded deployer ASKS for gas, on the registered topic', { skip }, asy
   // The ask covers the requirement with headroom, so a gas-price tick between the measurement and
   // the top-up landing does not leave the deployer short a second time.
   const required = BigInt(String(payload['requiredWei']))
-  const shortfall = BigInt(String(payload['shortfallWei']))
-  assert.equal(shortfall, required + required / 2n - 1n)
+  const amount = BigInt(String(payload['amountWei']))
+  assert.equal(amount, required + required / 2n - 1n)
 
   // No person. The platform topping up its own deployer out of its own treasury is not a fact
   // about the customer who bought the token.
@@ -460,8 +460,8 @@ test('the money arriving ends it: a funded retry deploys and asks for nothing mo
   `
   // Pay exactly what was asked for — which is what settlement's gas_topup transfers — rather than
   // a round number, so the headroom is proven sufficient rather than assumed.
-  const shortfall = BigInt(String(asked[0]?.payload['shortfallWei']))
-  node.setBalance(deployerFor(id), 1n + shortfall)
+  const amount = BigInt(String(asked[0]?.payload['amountWei']))
+  node.setBalance(deployerFor(id), 1n + amount)
 
   assert.equal(await driveDeploy(h.deploy, id), 'broadcast')
   const after = await sql<{ count: string }[]>`
