@@ -559,6 +559,8 @@ export interface HarnessOptions {
   readonly stuckMs?: number
   readonly leaseMs?: number
   readonly enabled?: boolean
+  readonly fundingMaxRequests?: number
+  readonly fundingCooldownMs?: number
   readonly now?: () => number
 }
 
@@ -590,6 +592,10 @@ export function harness(sql: postgres.Sql, options: HarnessOptions = {}): Harnes
       bounds: TEST_BOUNDS,
       leaseMs: options.leaseMs ?? 120_000,
       stuckMs: options.stuckMs ?? 30 * 60_000,
+      fundingMaxRequests: options.fundingMaxRequests ?? 3,
+      // No cooldown by default: a test that drives two passes back to back is asserting the LIMIT,
+      // and a five-minute wall between them would make every such test pass for the wrong reason.
+      fundingCooldownMs: options.fundingCooldownMs ?? 0,
       enabled: options.enabled ?? true,
       logger,
       metrics,

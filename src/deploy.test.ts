@@ -12,7 +12,14 @@ import test, { after, before, beforeEach } from 'node:test'
 import type postgres from 'postgres'
 import { driveDeploy } from './deploy.ts'
 import { NotImplementedError, familyFor, isImplemented } from './families.ts'
-import { BROADCAST_TOPIC, DEPLOYED_TOPIC, claimDeploy, findToken, listAttempts } from './tokens.ts'
+import {
+  BROADCAST_TOPIC,
+  DEPLOYED_TOPIC,
+  FUNDING_REQUESTED_TOPIC,
+  claimDeploy,
+  findToken,
+  listAttempts,
+} from './tokens.ts'
 import { buildEnvelope, type OutboxRow } from './outbox.ts'
 import { activityRecipient, envelopeDefects, notifyRecipient } from './topics.ts'
 import { createAddress, evmTxHash } from './evm.ts'
@@ -325,6 +332,142 @@ test('a funded deployer picked up on a later pass deploys normally', { skip }, a
   await driveDeploy(h.deploy, id)
   node.setBalance(deployerFor(id), 10n ** 18n)
   assert.equal(await driveDeploy(h.deploy, id), 'broadcast')
+})
+
+/**
+ * **THE HALF THAT DID NOT EXIST.** Everything above proves the deploy does not proceed unfunded.
+ * Nothing proved anyone was ever TOLD, and nothing was: a deployer address is minted per order and
+ * starts empty, so this branch is on the happy path of every deploy, and it used to write the row
+ * back to `awaiting_funds` and log a line. Every paid order on both networks sat there.
+ */
+test('an unfunded deployer ASKS for gas, on the registered topic', { skip }, async () => {
+  const { id } = await seedToken(sql as unknown as never)
+  const node = fakeNode({ balances: { [deployerFor(id).toLowerCase()]: 1n } })
+  const h = harness(sql, { node })
+
+  assert.equal(await driveDeploy(h.deploy, id), 'awaiting_funds')
+
+  const stored = await sql<OutboxRow[]>`
+    select id, topic, key, occurred_at, producer, version, actor, correlation_id, payload
+      from outbox where key = ${id} and topic = ${FUNDING_REQUESTED_TOPIC}
+  `
+  const row = stored[0]
+  assert.ok(row, 'nothing asked settlement for the gas this deploy cannot pay for')
+  assert.equal(row.key, id, 'keyed by token_id, which is what the registry declares')
+
+  // Through the relay's own builder and the JSON round trip that is the wire, because an envelope
+  // the contract refuses is delivered to nobody however correct the payload is.
+  const built = buildEnvelope(row)
+  assert.ok(built.ok, 'the relay would refuse the envelope it built from a real funding request')
+  const delivered = JSON.parse(JSON.stringify(built.value)) as {
+    topic: string
+    key: string
+    actor: string
+    payload: Record<string, unknown>
+  }
+  assert.deepEqual(envelopeDefects(delivered), [])
+  assert.equal(delivered.actor, 'service:mint')
+
+  const payload = delivered.payload
+  assert.equal(payload['tokenId'], id)
+  assert.equal(payload['chain'], 'ember')
+  assert.equal(payload['network'], 'testnet')
+  assert.equal(String(payload['deployerAddress']).toLowerCase(), deployerFor(id).toLowerCase())
+  assert.equal(payload['attempt'], 1, 'the first ask is attempt 1; settlement keys its transfer on it')
+  // Decimal strings, never JSON numbers: a wei quantity above 2^53 is silently rounded, and
+  // settlement's parser refuses anything that is not /^\d+$/ rather than coercing it.
+  for (const field of ['requiredWei', 'balanceWei', 'amountWei']) {
+    assert.equal(typeof payload[field], 'string', `${field} must be a decimal string`)
+    assert.match(String(payload[field]), /^\d+$/)
+  }
+  assert.equal(payload['balanceWei'], '1')
+  // The ask covers the requirement with headroom, so a gas-price tick between the measurement and
+  // the top-up landing does not leave the deployer short a second time.
+  const required = BigInt(String(payload['requiredWei']))
+  const amount = BigInt(String(payload['amountWei']))
+  assert.equal(amount, required + required / 2n - 1n)
+
+  // No person. The platform topping up its own deployer out of its own treasury is not a fact
+  // about the customer who bought the token.
+  assert.equal(payload['userId'], undefined)
+  assert.equal(activityRecipient(payload), null, 'platform plumbing landed in a person’s feed')
+  assert.equal(notifyRecipient(delivered), null, 'platform plumbing would notify a customer')
+})
+
+test('a second pass inside the cooldown does not ask twice', { skip }, async () => {
+  const { id } = await seedToken(sql as unknown as never)
+  const node = fakeNode({ balances: { [deployerFor(id).toLowerCase()]: 1n } })
+  // A real cooldown, and a clock the test controls. The sweep runs every tick, so without this a
+  // stuck order would spend its whole request allowance inside a minute — before the FIRST top-up
+  // had any chance to be mined — and then stop asking for ever.
+  let clock = 1_760_000_000_000
+  const h = harness(sql, { node, fundingCooldownMs: 5 * 60_000, now: () => clock })
+
+  await driveDeploy(h.deploy, id)
+  clock += 60_000
+  await driveDeploy(h.deploy, id)
+
+  const asks = await sql<{ count: string }[]>`
+    select count(*)::text as count from outbox where key = ${id} and topic = ${FUNDING_REQUESTED_TOPIC}
+  `
+  assert.equal(asks[0]?.count, '1', 'a second request went out before the first could confirm')
+  const held = await findToken(h.sql, id)
+  assert.equal(held?.status, 'awaiting_funds')
+  assert.equal(held?.leaseOwner, null, 'a held request still has to release the lease')
+  assert.equal(held?.fundingRequests, 1)
+
+  // Past the cooldown, it asks again — a genuine re-ask, with an attempt settlement can tell apart
+  // from a redelivery of the first.
+  clock += 5 * 60_000 + 1
+  await driveDeploy(h.deploy, id)
+  const second = await sql<{ payload: Record<string, unknown> }[]>`
+    select payload from outbox where key = ${id} and topic = ${FUNDING_REQUESTED_TOPIC}
+     order by occurred_at
+  `
+  assert.equal(second.length, 2)
+  assert.equal(second[1]?.payload['attempt'], 2)
+})
+
+test('an order that has asked its limit of times stops asking', { skip }, async () => {
+  const { id } = await seedToken(sql as unknown as never)
+  const node = fakeNode({ balances: { [deployerFor(id).toLowerCase()]: 1n } })
+  const h = harness(sql, { node, fundingMaxRequests: 2, fundingCooldownMs: 0 })
+
+  for (let pass = 0; pass < 5; pass += 1) {
+    assert.equal(await driveDeploy(h.deploy, id), 'awaiting_funds')
+  }
+
+  const asks = await sql<{ count: string }[]>`
+    select count(*)::text as count from outbox where key = ${id} and topic = ${FUNDING_REQUESTED_TOPIC}
+  `
+  // A bound, not a retry budget. If two top-ups have gone out and the address is still short, the
+  // third will not be the one that works and each one spends real treasury.
+  assert.equal(asks[0]?.count, '2', 'the request limit is not a limit')
+  const row = await findToken(h.sql, id)
+  assert.equal(row?.fundingRequests, 2)
+  assert.equal(row?.status, 'awaiting_funds', 'a capped order still waits where an operator can see it')
+  assert.equal(row?.leaseOwner, null)
+})
+
+test('the money arriving ends it: a funded retry deploys and asks for nothing more', { skip }, async () => {
+  const { id } = await seedToken(sql as unknown as never)
+  const node = fakeNode({ balances: { [deployerFor(id).toLowerCase()]: 1n } })
+  const h = harness(sql, { node })
+
+  await driveDeploy(h.deploy, id)
+  const asked = await sql<{ payload: Record<string, unknown> }[]>`
+    select payload from outbox where key = ${id} and topic = ${FUNDING_REQUESTED_TOPIC}
+  `
+  // Pay exactly what was asked for — which is what settlement's gas_topup transfers — rather than
+  // a round number, so the headroom is proven sufficient rather than assumed.
+  const amount = BigInt(String(asked[0]?.payload['amountWei']))
+  node.setBalance(deployerFor(id), 1n + amount)
+
+  assert.equal(await driveDeploy(h.deploy, id), 'broadcast')
+  const after = await sql<{ count: string }[]>`
+    select count(*)::text as count from outbox where key = ${id} and topic = ${FUNDING_REQUESTED_TOPIC}
+  `
+  assert.equal(after[0]?.count, '1', 'a funded deploy asked for money it did not need')
 })
 
 /* ------------------------------------------------------------------ outcomes */

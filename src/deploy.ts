@@ -61,6 +61,7 @@ import {
   recordAttempt,
   releaseLease,
   renewLease,
+  requestDeployerFunding,
   type TokenRecord,
 } from './tokens.ts'
 
@@ -75,6 +76,17 @@ export interface DeployDeps {
   readonly bounds: FeeBounds
   readonly leaseMs: number
   readonly stuckMs: number
+  /**
+   * How many times one order may ask settlement to fund its deployer before it stops asking.
+   *
+   * A bound rather than a retry budget. If three top-ups have gone out and the address is still
+   * short, the next one will not be the one that works — something is wrong with the estimate, the
+   * treasury or the chain — and continuing to ask spends real money on a wrong answer. The order
+   * stays in `awaiting_funds`, which is exactly where an operator can see it and fund it by hand.
+   */
+  readonly fundingMaxRequests: number
+  /** How long to wait between asks, so a top-up has blocks in which to confirm. */
+  readonly fundingCooldownMs: number
   readonly enabled: boolean
   readonly logger: Logger
   readonly metrics: Metrics
@@ -195,12 +207,7 @@ async function advance(deps: DeployDeps, claimed: TokenRecord): Promise<DriveRes
   //    through and the deploy then dies at `estimateGas` with the lease already claimed.
   const funding = await family.funding(ctx, rpc, deps.bounds)
   if (!funding.funded) {
-    deps.logger.info('deploy is awaiting funds', {
-      tokenId: token.id,
-      required: funding.required.toString(),
-      balance: funding.balance.toString(),
-    })
-    await awaitFunds(deps, token.id)
+    await askForFunds(deps, token, funding)
     return 'awaiting_funds'
   }
   await heartbeat(deps, token.id)
@@ -367,13 +374,72 @@ async function resumeIfSigned(deps: DeployDeps, tokenId: string): Promise<DriveR
   }
 }
 
-/** Move back to `awaiting_funds` and release, so a funded deployer is picked up on the next pass. */
-async function awaitFunds(deps: DeployDeps, tokenId: string): Promise<void> {
-  await deps.sql`
-    update tokens
-       set status = 'awaiting_funds', lease_owner = null, lease_until = null, updated_at = now()
-     where id = ${tokenId} and lease_owner = ${deps.owner} and status = 'deploying' and raw_tx is null
-  `
+/**
+ * Move back to `awaiting_funds`, release the lease, and ASK FOR THE MONEY.
+ *
+ * The ask is the half that did not exist. A deployer address is minted per order and starts empty,
+ * so this branch is on the happy path of every single deploy — and until `requestDeployerFunding`
+ * it did nothing but write the row back and log a line, which is why a paid order sat here for
+ * ever. This service cannot fund the address itself: it holds `custody:sign:deployer` and no other
+ * signing scope, so the transfer belongs to settlement, which holds `custody:sign:treasury`.
+ *
+ * Everything here is a LOG, never a throw. "The deployer has no gas yet" is an ordinary state of a
+ * deploy, and throwing would burn a runner attempt and back the whole sweep off.
+ */
+async function askForFunds(
+  deps: DeployDeps,
+  token: TokenRecord,
+  funding: { readonly required: bigint; readonly balance: bigint },
+): Promise<void> {
+  const outcome = await requestDeployerFunding(deps.sql, deps.producer, {
+    id: token.id,
+    owner: deps.owner,
+    required: funding.required,
+    balance: funding.balance,
+    maxRequests: deps.fundingMaxRequests,
+    cooldownMs: deps.fundingCooldownMs,
+    at: new Date((deps.now ?? Date.now)()),
+    actor: `service:${deps.producer}`,
+    correlationId: token.id,
+  })
+
+  if (outcome.kind === 'requested') {
+    deps.metrics.increment('mint_deploy_funding_requests_total', { chain: token.chain })
+    deps.logger.info('deploy is awaiting funds; asked settlement to top the deployer up', {
+      tokenId: token.id,
+      chain: token.chain,
+      deployerAddress: token.deployerAddress,
+      required: funding.required.toString(),
+      balance: funding.balance.toString(),
+      requested: outcome.amount.toString(),
+      attempt: outcome.attempt,
+    })
+    return
+  }
+
+  if (outcome.kind === 'held') {
+    deps.metrics.increment('mint_deploy_funding_held_total', {
+      chain: token.chain,
+      reason: outcome.reason,
+    })
+    // `limit_reached` is the one an operator has to act on: three top-ups have been sent and the
+    // address is still short, so the order will not move without a person. Warn, with the numbers.
+    const log = outcome.reason === 'cooling_down' ? deps.logger.info : deps.logger.warn
+    log.call(deps.logger, 'deploy is awaiting funds; no request was sent', {
+      tokenId: token.id,
+      chain: token.chain,
+      deployerAddress: token.deployerAddress,
+      reason: outcome.reason,
+      attempts: outcome.attempts,
+      required: funding.required.toString(),
+      balance: funding.balance.toString(),
+    })
+    return
+  }
+
+  // The lease moved while we were measuring. Another replica owns this row now and has its own
+  // measurement; ours is stale and must not be acted on.
+  deps.logger.info('deploy funding skipped: the lease is no longer ours', { tokenId: token.id })
 }
 
 async function fail(deps: DeployDeps, token: TokenRecord, reason: string): Promise<void> {

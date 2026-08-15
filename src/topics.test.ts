@@ -151,8 +151,15 @@ test('THE DEFECT: every registry topic this service owns is actually emitted', (
     [],
     'the registry says mint produces these and no emit site does — every consumer of each is dead code',
   )
-  // And the registry is being read rather than the check passing vacuously.
-  assert.deepEqual(topicsProducedBy(SERVICE), ['mint.deploy.confirmed'])
+  // And the registry is being read rather than the check passing vacuously. Two topics now, not one:
+  // `mint.deploy.funding_requested` is emitted by `requestDeployerFunding` when a per-order deployer
+  // address cannot pay its own gas. It is owned by mint and consumed by settlement, which answers it
+  // with a `gas_topup` outbound — so if it ever stops being emitted, every paid deploy stalls at
+  // `awaiting_funds` in silence, which is exactly the failure this test exists to name.
+  assert.deepEqual(topicsProducedBy(SERVICE), [
+    'mint.deploy.confirmed',
+    'mint.deploy.funding_requested',
+  ])
   assert.ok(TOPIC_NAMES.length >= 40)
 })
 

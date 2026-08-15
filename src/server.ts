@@ -153,6 +153,18 @@ export function registerServiceMetrics(metrics: Metrics): Metrics {
       kind: 'counter',
       labels: [],
     })
+    .register({
+      name: 'mint_deploy_funding_requests_total',
+      help: 'Gas asked of the treasury for a per-order deployer. One per paid deploy is normal — a freshly derived address always holds zero.',
+      kind: 'counter',
+      labels: ['chain'],
+    })
+    .register({
+      name: 'mint_deploy_funding_held_total',
+      help: 'Deploys parked at awaiting_funds WITHOUT asking, by reason. Non-zero means orders are waiting on a human.',
+      kind: 'counter',
+      labels: ['chain', 'reason'],
+    })
 }
 
 const SAFE_REQUEST_ID = /^[A-Za-z0-9_-]{1,64}$/
