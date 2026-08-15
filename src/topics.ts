@@ -59,6 +59,7 @@ import {
   CREATED_TOPIC,
   DEPLOYED_TOPIC,
   FAILED_TOPIC,
+  FUNDING_REQUESTED_TOPIC,
   PAID_TOPIC,
 } from './tokens.ts'
 
@@ -78,6 +79,7 @@ export const EMITTED_TOPICS = Object.freeze([
   BROADCAST_TOPIC,
   DEPLOYED_TOPIC,
   FAILED_TOPIC,
+  FUNDING_REQUESTED_TOPIC,
 ] as const)
 
 export interface ProposedTopic {
@@ -99,9 +101,9 @@ export interface ProposedTopic {
  *     empties itself rather than rotting into a permanent allow-list.
  *   - An emit site whose topic is in neither the registry nor here fails the test.
  *
- * `keyedBy` on each is read off the emit site, never chosen here: all five are keyed by the token id
- * (`tokens.ts`), which is what the registry already says for
- * `mint.deploy.confirmed` and is therefore the whole family's partition.
+ * `keyedBy` on each is read off the emit site, never chosen here: all six are keyed by the token id
+ * (`tokens.ts`), which is what the registry already says for `mint.deploy.confirmed` and
+ * `mint.deploy.funding_requested` and is therefore the whole family's partition.
  *
  * ## Why these four are PROPOSED rather than deleted
  *
@@ -173,6 +175,10 @@ export const KEYED_BY: Readonly<Record<string, string>> = Object.freeze({
   [BROADCAST_TOPIC]: 'token_id',
   [DEPLOYED_TOPIC]: 'token_id',
   [FAILED_TOPIC]: 'token_id',
+  // The token, not the deployer address, even though the address is what gets funded. The address
+  // is minted per order and belongs to exactly one token, so keying by it would partition the same
+  // way while giving settlement a key it cannot join back to an order.
+  [FUNDING_REQUESTED_TOPIC]: 'token_id',
 })
 
 /* ------------------------------------------------------------------ reconciliation */

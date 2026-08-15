@@ -501,6 +501,63 @@ export const MIGRATIONS: readonly Migration[] = [
       -- authenticate with, so no live path can re-create a page for an erased token.
     `,
   },
+
+  {
+    version: 8,
+    name: 'deployer_funding',
+    up: `
+      -- ══════════════════════════════════════════════════════════════════════════════════════════
+      -- ASKING FOR GAS, ONCE, AND BEING ABLE TO PROVE IT.
+      --
+      -- A paid order's deployer address is minted per order and holds nothing. deploy.ts measures
+      -- the shortfall and puts the row back in 'awaiting_funds'; until now that was the end of the
+      -- sentence, and every paid order on both networks sat in that loop for ever because nothing
+      -- in this service holds the credential that could fund the address.
+      --
+      -- It now emits mint.deploy.funding_requested, which settlement (which DOES hold
+      -- custody:sign:treasury) turns into a gas_topup. These three columns are what make that emit
+      -- BOUNDED rather than a loop with an event in it:
+      --
+      --   funding_requests      how many times this token has asked. The sweep runs every tick, so
+      --                         without a counter one under-funded order would emit an event per
+      --                         tick for ever — a self-inflicted flood aimed at the one service
+      --                         that spends the treasury.
+      --   funding_requested_at  when it last asked. A top-up needs blocks to confirm; asking again
+      --                         two seconds later plans a SECOND transfer for a shortfall the first
+      --                         one already covers. This is the cooldown the emit tests against.
+      --   funding_requested_wei what it asked for, so an operator looking at a stuck order can see
+      --                         the number that was requested rather than re-deriving today's gas
+      --                         price and getting a different answer.
+      --
+      -- funding_requests is also the "attempt" on the wire, and settlement's idempotency key is
+      -- built from (token_id, attempt). That is what makes a genuine second ask a second transfer
+      -- while a redelivery of the first stays one — the property a bare timestamp cannot give.
+      --
+      -- Nullable and defaulted rather than back-filled: a token that never needed gas has never
+      -- asked for it, and 0 is the truthful count for every existing row.
+      -- ══════════════════════════════════════════════════════════════════════════════════════════
+      alter table tokens
+        add column if not exists funding_requests integer not null default 0;
+      alter table tokens
+        add column if not exists funding_requested_at timestamptz;
+      alter table tokens
+        add column if not exists funding_requested_wei numeric(78,0);
+
+      -- A count is never negative, and a request always records what it asked for. The pair is
+      -- written by one UPDATE, so a row with a timestamp and no amount means somebody wrote one of
+      -- the two by hand.
+      alter table tokens
+        drop constraint if exists tokens_funding_requests_nonneg;
+      alter table tokens
+        add constraint tokens_funding_requests_nonneg check (funding_requests >= 0);
+      alter table tokens
+        drop constraint if exists tokens_funding_request_is_complete;
+      alter table tokens
+        add constraint tokens_funding_request_is_complete check (
+          (funding_requested_at is null) = (funding_requested_wei is null)
+        );
+    `,
+  },
 ]
 
 /**

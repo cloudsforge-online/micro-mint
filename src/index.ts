@@ -265,6 +265,8 @@ const deploy: DeployDeps = {
   },
   leaseMs: 120_000,
   stuckMs: env.stuckMinutes * 60_000,
+  fundingMaxRequests: env.fundingMaxRequests,
+  fundingCooldownMs: env.fundingCooldownMinutes * 60_000,
   enabled: env.deploysEnabled,
   logger: logger.child({ component: 'deploy' }),
   metrics,

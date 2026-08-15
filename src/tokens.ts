@@ -130,6 +130,18 @@ export interface TokenRecord {
   readonly leaseOwner: string | null
   readonly leaseUntil: Date | null
   readonly deployAttempts: number
+  /**
+   * How many times this order has asked settlement to fund its deployer. See migration 8.
+   *
+   * This is the `attempt` on `mint.deploy.funding_requested`, and settlement's idempotency key is
+   * built from it — which is what makes a genuine second ask a second transfer while a redelivery
+   * of the first stays one.
+   */
+  readonly fundingRequests: number
+  /** When it last asked, on THIS service's clock — the cooldown is measured against it. */
+  readonly fundingRequestedAt: Date | null
+  /** What it last asked for, in wei. Null until it has asked. */
+  readonly fundingRequestedWei: bigint | null
   readonly createdAt: Date
   readonly updatedAt: Date
 }
@@ -170,6 +182,9 @@ interface TokenRow {
   readonly lease_owner: string | null
   readonly lease_until: Date | null
   readonly deploy_attempts: number
+  readonly funding_requests: number
+  readonly funding_requested_at: Date | null
+  readonly funding_requested_wei: string | null
   readonly created_at: Date
   readonly updated_at: Date
 }
@@ -181,7 +196,8 @@ const COLUMNS = `
   price_usd_cents, price_shards, charge_asset_code, charge_amount, rate_usd_scaled,
   paid_journal_entry_id, paid_at, deployer_address, deploy_nonce, raw_tx, custody_audit_id,
   deploy_tx_hash, contract_address, broadcast_at, confirmed_at, failure_reason, lease_owner,
-  lease_until, deploy_attempts, created_at, updated_at
+  lease_until, deploy_attempts, funding_requests, funding_requested_at, funding_requested_wei,
+  created_at, updated_at
 `
 
 export function toToken(row: TokenRow): TokenRecord {
@@ -228,6 +244,13 @@ export function toToken(row: TokenRow): TokenRecord {
     leaseOwner: row.lease_owner,
     leaseUntil: row.lease_until,
     deployAttempts: row.deploy_attempts,
+    fundingRequests: row.funding_requests,
+    fundingRequestedAt: row.funding_requested_at,
+    // numeric(78,0), so a string, for the same reason `supply` is one: a wei amount read through
+    // Number() is rounded, and this one is a figure an operator compares against what settlement
+    // actually sent.
+    fundingRequestedWei:
+      row.funding_requested_wei === null ? null : BigInt(row.funding_requested_wei),
     createdAt: row.created_at,
     updatedAt: row.updated_at,
   }
@@ -350,6 +373,23 @@ export const BROADCAST_TOPIC = 'mint.token.broadcast'
  */
 export const DEPLOYED_TOPIC = 'mint.deploy.confirmed'
 export const FAILED_TOPIC = 'mint.token.failed'
+/**
+ * Registered as `mint.deploy.funding_requested` — the sentence that was missing between the two
+ * services that each hold half of a deploy.
+ *
+ * A paid order's deployer address is minted per order and holds nothing. This service measures the
+ * shortfall exactly (`families.ts` `funding`) and can do nothing about it: it holds
+ * `custody:sign:deployer` and no other signing scope, so it cannot spend the treasury the gas has
+ * to come from. Settlement holds `custody:sign:treasury` and already knows how to send platform
+ * gas to a platform address — that is the `gas_topup` purpose its own sweep uses. Until this topic
+ * existed there was no way to say so, and `awaitFunds` put the row back in `awaiting_funds` to be
+ * measured again on the next tick, for ever.
+ *
+ * An outbox row rather than an HTTP call because 03 §2 rule 5 says a state change others care
+ * about is written in the same transaction as the change, and because settlement's only write
+ * surface is `POST /v1/events`.
+ */
+export const FUNDING_REQUESTED_TOPIC = 'mint.deploy.funding_requested'
 
 export async function createToken(
   sql: Db,
@@ -535,6 +575,170 @@ export async function markProvisioned(
   `
   const row = rows[0]
   return row ? toToken(row) : null
+}
+
+/* ------------------------------------------------------------------ asking for gas */
+
+/** What one pass over an under-funded deploy did. Every branch releases the lease. */
+export type FundingRequest =
+  | {
+      readonly kind: 'requested'
+      /** 1 for the first ask. Also the `attempt` on the wire and in settlement's idempotency key. */
+      readonly attempt: number
+      /** What was asked for, in wei — the shortfall plus headroom. */
+      readonly amount: bigint
+      readonly token: TokenRecord
+    }
+  | {
+      readonly kind: 'held'
+      readonly reason: 'limit_reached' | 'cooling_down' | 'no_deployer'
+      readonly attempts: number
+    }
+  | { readonly kind: 'not_claimed' }
+
+/**
+ * How much headroom to ask for beyond the measured requirement, as a percentage of it.
+ *
+ * Asking for the exact shortfall is the mistake that looks correct. `funding` measures against
+ * `eth_gasPrice` at that instant; the top-up then has to be planned, signed, broadcast and mined
+ * before the next pass re-measures, and any upward tick in that window leaves the deployer short
+ * AGAIN by a few thousand wei — a second full request cycle, and on the third one the order hits
+ * the request limit and stops for a rounding error. Fifty per cent of a ~0.0014 EMBER deploy is a
+ * fraction of a cent, so this is bought very cheaply.
+ */
+const FUNDING_HEADROOM_PCT = 50n
+
+/** What to ask for: enough to cover the requirement with headroom, less what is already there. */
+export function fundingAmount(required: bigint, balance: bigint): bigint {
+  const target = required + (required * FUNDING_HEADROOM_PCT) / 100n
+  return target > balance ? target - balance : 0n
+}
+
+/**
+ * The payload of `mint.deploy.funding_requested`, as a pure function of the row and the
+ * measurement. Pulled out of the emit for the same reason as `deployConfirmedPayload`: a guard
+ * that needs a database to fail is skipped exactly when somebody is in a hurry.
+ *
+ * Every amount is a DECIMAL STRING. A wei quantity in a JSON number is silently rounded above
+ * 2^53, and settlement's parser refuses anything that is not `/^\d+$/` rather than coercing.
+ *
+ * There is deliberately **no `userId`**. A customer paid for a token; the platform topping up its
+ * own deployer address out of its own treasury is not a fact about that customer, and putting a
+ * user on it would file platform plumbing in a person's activity feed.
+ */
+export function fundingRequestedPayload(
+  token: TokenRecord,
+  measured: { readonly required: bigint; readonly balance: bigint },
+): Record<string, unknown> {
+  return {
+    tokenId: token.id,
+    chain: token.chain,
+    network: token.network,
+    deployerAddress: token.deployerAddress,
+    requiredWei: measured.required.toString(),
+    balanceWei: measured.balance.toString(),
+    // What is being ASKED for, which is the requirement plus headroom less the balance — not
+    // `required - balance`. Settlement transfers this figure and does not recompute it: it has no
+    // gas estimate for a creation it is not building.
+    shortfallWei: (token.fundingRequestedWei ?? 0n).toString(),
+    attempt: token.fundingRequests,
+  }
+}
+
+/**
+ * **THE ASK.** Release the lease into `awaiting_funds` and, if this order is still allowed to,
+ * tell settlement its deployer cannot pay for itself.
+ *
+ * This replaces a bare `update … set status = 'awaiting_funds'` that had no event and no counter,
+ * and which is why every paid order on both networks sat waiting for money nobody was sending.
+ *
+ * Both branches END IN THE SAME PLACE — `awaiting_funds`, lease released — because the next tick
+ * must re-measure either way: a top-up may have landed since, and a held request must still be
+ * picked up once the cooldown expires.
+ *
+ * The bounds are the whole reason this is one conditional UPDATE rather than a read and a write.
+ * The sweep runs every tick, so a plain emit would send one event per tick per stuck order at the
+ * one service that spends the treasury; and two ticks in the same minute would plan two transfers
+ * for a shortfall the first already covers. `funding_requests < maxRequests` and the cooldown are
+ * checked by the DATABASE in the same statement that increments the counter, so two replicas
+ * racing produce one request and not two.
+ */
+export async function requestDeployerFunding(
+  sql: Db,
+  producer: string,
+  input: {
+    readonly id: string
+    readonly owner: string
+    readonly required: bigint
+    readonly balance: bigint
+    readonly maxRequests: number
+    readonly cooldownMs: number
+    /** The SERVICE's clock, stamped and compared in one domain — see `markBroadcast`. */
+    readonly at: Date
+    readonly actor: string
+    readonly correlationId: string
+  },
+): Promise<FundingRequest> {
+  const amount = fundingAmount(input.required, input.balance)
+  return withOutbox(sql, producer, async (tx, emit) => {
+    const asked = await tx<TokenRow[]>`
+      update tokens
+         set status = 'awaiting_funds',
+             lease_owner = null,
+             lease_until = null,
+             funding_requests = funding_requests + 1,
+             funding_requested_at = ${input.at.toISOString()}::timestamptz,
+             funding_requested_wei = ${amount.toString()}::numeric,
+             updated_at = now()
+       where id = ${input.id}
+         and lease_owner = ${input.owner}
+         and status = 'deploying'
+         and raw_tx is null
+         -- Nothing to fund without an address to fund. The deploy job provisions one before it
+         -- measures, so this is null only if custody answered and the write did not land.
+         and deployer_address is not null
+         and funding_requests < ${input.maxRequests}
+         and (
+           funding_requested_at is null
+           or funding_requested_at
+              < ${input.at.toISOString()}::timestamptz - make_interval(secs => ${input.cooldownMs / 1000})
+         )
+      returning ${tx.unsafe(COLUMNS)}
+    `
+    const row = asked[0]
+    if (row) {
+      const token = toToken(row)
+      emit({
+        topic: FUNDING_REQUESTED_TOPIC,
+        key: token.id,
+        payload: fundingRequestedPayload(token, input),
+        actor: input.actor,
+        correlationId: input.correlationId,
+      })
+      return { kind: 'requested', attempt: token.fundingRequests, amount, token }
+    }
+
+    // Not allowed to ask — over the limit, inside the cooldown, or with no address. The row still
+    // has to leave `deploying`, or the lease holds a deploy nobody is advancing until it expires.
+    const released = await tx<TokenRow[]>`
+      update tokens
+         set status = 'awaiting_funds', lease_owner = null, lease_until = null, updated_at = now()
+       where id = ${input.id}
+         and lease_owner = ${input.owner}
+         and status = 'deploying'
+         and raw_tx is null
+      returning ${tx.unsafe(COLUMNS)}
+    `
+    const held = released[0]
+    if (!held) return { kind: 'not_claimed' }
+    const token = toToken(held)
+    const reason = !token.deployerAddress
+      ? 'no_deployer'
+      : token.fundingRequests >= input.maxRequests
+        ? 'limit_reached'
+        : 'cooling_down'
+    return { kind: 'held', reason, attempts: token.fundingRequests }
+  })
 }
 
 /**

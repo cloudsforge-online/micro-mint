@@ -307,6 +307,22 @@ export interface Env {
   /** How long a deploy may sit unconfirmed before it is called stuck and an operator is told. */
   readonly stuckMinutes: number
   /**
+   * How many times one order may ask settlement to fund its deployer address.
+   *
+   * A bound, not a retry budget: if three top-ups have been sent and the address is still short,
+   * the fourth will not be the one that works, and each one spends real treasury. The order waits
+   * in `awaiting_funds` for an operator instead.
+   */
+  readonly fundingMaxRequests: number
+  /**
+   * The gap between one order's funding requests, in minutes.
+   *
+   * A top-up has to be planned, signed, broadcast and MINED before the deployer's balance changes.
+   * The sweep re-measures every tick, so without this a stuck order would exhaust its whole request
+   * allowance inside a minute, before the first transfer had a chance to land.
+   */
+  readonly fundingCooldownMinutes: number
+  /**
    * The price of one token deploy, in **US cents**. Quoted at `POST /tokens`, settled at
    * `POST /pay`.
    *
@@ -412,6 +428,11 @@ export function loadEnv(source: Source = process.env, host = ''): Env {
     // an incident. The frozen service had 180 SECONDS, and it was a request timeout rather than a
     // stuck deadline — see the header of `deploy.ts`.
     stuckMinutes: integer(source, 'MINT_STUCK_MINUTES', 30, 1, 1_440),
+    fundingMaxRequests: integer(source, 'MINT_FUNDING_MAX_REQUESTS', 3, 0, 20),
+    // Five minutes is many blocks on every chain this service deploys to, and it is short enough
+    // that a customer watching the status page sees the second attempt rather than giving up.
+    // Zero is allowed and means no cooldown, which is what the tests use.
+    fundingCooldownMinutes: integer(source, 'MINT_FUNDING_COOLDOWN_MINUTES', 5, 0, 1_440),
     deployPriceUsdCents,
     // Not read from the environment. EMBER is the estate's settlement asset and the only chain-
     // backed unit a customer holds; making it configurable would be offering an operator a way to
