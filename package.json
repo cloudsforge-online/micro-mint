@@ -1,6 +1,6 @@
 {
   "name": "@cloudsforge/mint",
-  "version": "2026.8.85",
+  "version": "2026.8.86",
   "private": true,
   "description": "Token creation. Orders, a token registry, contracts compiled to committed bytecode, and a deploy that leaves the HTTP request: POST /tokens/:id/deploy answers 202 with a status URL and the chain work runs as a leased job.",
   "license": "MIT",
