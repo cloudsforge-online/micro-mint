@@ -12,6 +12,7 @@
  * person attached to it for ever.
  */
 
+import { singleNetworkSql } from './server.test.ts'
 import assert from 'node:assert/strict'
 import test, { after, before, beforeEach } from 'node:test'
 import { randomUUID } from 'node:crypto'
@@ -71,7 +72,8 @@ before(async () => {
     logger: new Logger({ service: 'mint-test', level: 'fatal', sink: () => {} }),
     metrics,
     verifier,
-    sql: db,
+    sql: singleNetworkSql(db),
+    singleNetwork: 'mainnet' as const,
     producer: 'mint',
     network: 'testnet',
     pay: { sql: db, ledger: fakeLedger(), pricing: fakePricing(), settlementAsset: 'EMBER', producer: 'mint' },

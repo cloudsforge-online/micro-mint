@@ -6,6 +6,7 @@
  * receipt wait inside the request, which is what a rolling deploy cuts in half.
  */
 
+import { networkSql, type Sql as RuntimeSql } from '@cloudsforge/db'
 import assert from 'node:assert/strict'
 import test, { after, before, beforeEach } from 'node:test'
 import type { AddressInfo } from 'node:net'
@@ -86,7 +87,8 @@ before(async () => {
     logger: new Logger({ service: 'mint-test', level: 'fatal', sink: () => {} }),
     metrics,
     verifier,
-    sql: db,
+    sql: singleNetworkSql(db),
+    singleNetwork: 'mainnet' as const,
     producer: 'mint',
     network: 'testnet',
     pay: { sql: db, ledger, pricing: fakePricing(), settlementAsset: 'EMBER', producer: 'mint' },
@@ -559,3 +561,12 @@ test('a paid order reports what was quoted AND what was taken', { skip }, async 
   assert.equal(token['rateUsdScaled'], '250000')
   assert.equal(token['priceShards'], undefined)
 })
+
+/**
+ * One handle, presented as the per-network selector the server now takes. The fixture runs against
+ * a single test database, so mainnet is the only configured network — which exercises the REFUSAL
+ * path for free: anything reaching for testnet throws rather than reusing this handle.
+ */
+export function singleNetworkSql(db: unknown) {
+  return networkSql({ mainnet: db as RuntimeSql })
+}
