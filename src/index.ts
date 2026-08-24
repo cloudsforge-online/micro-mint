@@ -19,7 +19,7 @@
  */
 
 import postgres from 'postgres'
-import { assertSchemaAtLeast, type Sql as DbSql } from '@cloudsforge/db'
+import { assertSchemaAtLeast, type Sql as DbSql , networkSql, type Sql as RuntimeSql } from '@cloudsforge/db'
 import { JobQueue, JobRunner, type Sql as JobsSql } from '@cloudsforge/jobs'
 import { Verifier, serviceTokenProbe } from '@cloudsforge/auth'
 import { NO_SCOPES_REQUIRED } from '@cloudsforge/contracts-auth'
@@ -67,23 +67,40 @@ logger.info('starting', {
 
 // 3. The database pool. Opened before the schema assertion for the obvious reason that the
 //    assertion is a query, and before the Lifecycle because the readiness probe closes over it.
-const sql = postgres(env.databaseUrl, {
+const poolOptions = {
   max: env.databasePoolMax,
   // postgres.js writes notices to stderr as unstructured text by default, which is how a
   // connection string ends up in a log the collector cannot parse.
   onnotice: () => {},
-})
+}
+const sql = postgres(env.databaseUrl, poolOptions)
+
+// ── ONE HANDLE PER NETWORK THIS DEPLOYMENT SERVES ────────────────────────────────────────────
+//
+// `MINT_DATABASE_URL_TESTNET` unset is the single-network case, which is every deployment until the
+// consolidation reaches this service. `networkSql` then holds one handle and REFUSES a testnet
+// request rather than answering it out of mainnet rows — substituting would be a query that
+// SUCCEEDS against the other estate and says nothing.
+const sqlTestnet = env.databaseUrlTestnet ? postgres(env.databaseUrlTestnet, poolOptions) : undefined
 
 // 4. Assert the schema. This does NOT migrate. Failing here rather than serving is the point: a
 //    replica of the new code answering against the old schema is a replica whose broadcast
 //    constraint may not exist, and that is the constraint standing between a lost confirmation
 //    race and a second deploy.
-try {
-  await assertSchemaAtLeast(sql as unknown as DbSql, SCHEMA_VERSION)
-} catch (err) {
-  logger.fatal('schema assertion failed', { err, required: SCHEMA_VERSION })
-  await sql.end({ timeout: 5 }).catch(() => {})
-  process.exit(1)
+// Asserted on EVERY network, not only the first: a testnet database behind on migrations would
+// otherwise be found by the first testnet request rather than here, at boot.
+for (const [network, handle] of [
+  ['mainnet', sql] as const,
+  ...(sqlTestnet ? ([['testnet', sqlTestnet]] as const) : []),
+]) {
+  try {
+    await assertSchemaAtLeast(handle as unknown as DbSql, SCHEMA_VERSION)
+  } catch (err) {
+    logger.fatal('schema assertion failed', { err, required: SCHEMA_VERSION, network })
+    await sql.end({ timeout: 5 }).catch(() => {})
+    await sqlTestnet?.end({ timeout: 5 }).catch(() => {})
+    process.exit(1)
+  }
 }
 
 // 5. The upstreams, and the credential that authenticates every call to them. Constructed before
@@ -241,20 +258,54 @@ lifecycle
 // 7. The dependency bundles, built once and shared so the routes and the worker cannot disagree
 //    about which network they are on or which bounds they are enforcing.
 const db = sql as unknown as Db
-const queue = new JobQueue(sql as unknown as JobsSql, {
-  owner: env.instanceId,
-  // Longer than the default 60 seconds because a deploy job holds its lease across a node round
-  // trip, a custody round trip and a broadcast. The handler renews between steps, so this is the
-  // ceiling on a STEP rather than on the job — which is the frozen service's mistake: its lease
-  // was sized against the receipt wait alone and one slow RPC expires it before bytes exist.
-  leaseMs: 120_000,
-})
+const queueFor = (handle: typeof sql) =>
+  new JobQueue(handle as unknown as JobsSql, {
+    owner: env.instanceId,
+    // Longer than the default 60 seconds because a deploy job holds its lease across a node round
+    // trip, a custody round trip and a broadcast. The handler renews between steps, so this is the
+    // ceiling on a STEP rather than on the job — which is the frozen service's mistake: its lease
+    // was sized against the receipt wait alone and one slow RPC expires it before bytes exist.
+    leaseMs: 120_000,
+  })
 
-const deploy: DeployDeps = {
-  sql: db,
+/**
+ * One plane per network: pool, handle, queue, deploy worker.
+ *
+ * The queue is per-network because an enqueue is a WRITE and a deploy job is the most consequential
+ * write this service makes — it spends gas from a custody key on a real chain.
+ */
+const planes = [
+  { network: 'mainnet' as const, pool: sql, db, queue: queueFor(sql) },
+  ...(sqlTestnet
+    ? [
+        {
+          network: 'testnet' as const,
+          pool: sqlTestnet,
+          db: sqlTestnet as unknown as Db,
+          queue: queueFor(sqlTestnet),
+        },
+      ]
+    : []),
+]
+const planeFor = (network: 'mainnet' | 'testnet') => {
+  const plane = planes.find((p) => p.network === network)
+  if (!plane) throw new Error(`no plane for network ${network}`)
+  return plane
+}
+const queue = planeFor('mainnet').queue
+
+/**
+ * The deploy worker's dependencies, per network.
+ *
+ * `network` is not a label here: it selects the CHAIN a deployment goes to, the custody key that
+ * signs it and the gas that pays for it. One worker per network, each closed over its own handle
+ * and its own network, is the only shape where a testnet order cannot deploy a mainnet contract.
+ */
+const deployFor = (handle: Db, network: 'mainnet' | 'testnet'): DeployDeps => ({
+  sql: handle,
   producer: SERVICE,
   owner: env.instanceId,
-  network: env.network,
+  network,
   custody,
   indexer,
   rpc,
@@ -268,9 +319,9 @@ const deploy: DeployDeps = {
   fundingMaxRequests: env.fundingMaxRequests,
   fundingCooldownMs: env.fundingCooldownMinutes * 60_000,
   enabled: env.deploysEnabled,
-  logger: logger.child({ component: 'deploy' }),
+  logger: logger.child({ component: 'deploy', network }),
   metrics,
-}
+})
 
 // 8. Routes. After the Lifecycle so the health handlers report real state, and after the pool so
 //    the stores are real rather than a lazily-connected surprise on the first request.
@@ -280,8 +331,14 @@ const server = createServer({
   logger,
   metrics,
   verifier,
-  sql: db,
+  // The SELECTOR, not a handle — routes use `ctx.sql`, resolved once per request.
+  sql: networkSql({
+    mainnet: sql as unknown as RuntimeSql,
+    ...(sqlTestnet ? { testnet: sqlTestnet as unknown as RuntimeSql } : {}),
+  }),
+  ...(env.singleNetwork ? { singleNetwork: env.singleNetwork as 'mainnet' | 'testnet' } : {}),
   producer: SERVICE,
+  // The boot-time default. `forRequest` replaces it with the network the gateway stamped.
   network: env.network,
   pay: { sql: db, ledger, pricing, settlementAsset: env.settlementAsset, producer: SERVICE },
   render: { sql: db, indexer },
@@ -297,49 +354,60 @@ const server = createServer({
   // Queue depth is sampled at scrape time rather than on a timer. There is no `setInterval` in
   // this repository, and CI greps for one — rule 8.
   beforeScrape: async () => {
-    const stats = await queue.stats()
-    metrics.set('jobs_pending', stats.pending)
-    metrics.set('jobs_overdue', stats.overdue)
+    // Per network. Summed across both queues the gauge reads healthy while one estate's deploy
+    // backlog grows for ever — micro-org#398 in another form.
+    for (const plane of planes) {
+      const stats = await plane.queue.stats()
+      metrics.set('jobs_pending', stats.pending, { network: plane.network })
+      metrics.set('jobs_overdue', stats.overdue, { network: plane.network })
+    }
   },
 })
 
-// 9. The job runner, started before `listen()`. Background work is claimed under a lease, so a
-//    replica that is draining stops claiming before it stops serving — `shouldClaim` is wired to
-//    the Lifecycle for exactly that.
-const reschedule = rescheduleRecurring(queue, env.network, logger)
-const runner = new JobRunner({
-  queue,
-  concurrency: 4,
-  pollMs: 1_000,
-  shouldClaim: () => lifecycle.claimingJobs,
-  onEvent: (event) => {
-    if (event.kind) {
-      if (event.type === 'claimed') metrics.increment('jobs_claimed_total', { kind: event.kind })
-      if (event.type === 'completed') metrics.increment('jobs_completed_total', { kind: event.kind })
-      if (event.type === 'failed') metrics.increment('jobs_failed_total', { kind: event.kind })
-      if (event.type === 'dead') metrics.increment('jobs_dead_total', { kind: event.kind })
-      if (event.durationMs !== undefined) {
-        metrics.observe('jobs_duration_ms', event.durationMs, { kind: event.kind })
+// 9. The job runners — ONE PER NETWORK, started before `listen()`. Background work is claimed
+//    under a lease, so a replica that is draining stops claiming before it stops serving.
+//
+//    Bulkheaded, and here that is not a tidiness argument: `deploy.network` selects the CHAIN a
+//    contract goes to, the custody key that signs it and the gas that pays for it. One runner over
+//    one queue would have every testnet order deploying against mainnet, spending real gas, and
+//    recording success.
+const runners = planes.map((plane) => {
+  const reschedule = rescheduleRecurring(plane.queue, plane.network, logger)
+  const runner = new JobRunner({
+    queue: plane.queue,
+    concurrency: 4,
+    pollMs: 1_000,
+    shouldClaim: () => lifecycle.claimingJobs,
+    onEvent: (event) => {
+      if (event.kind) {
+        const labels = { kind: event.kind, network: plane.network }
+        if (event.type === 'claimed') metrics.increment('jobs_claimed_total', labels)
+        if (event.type === 'completed') metrics.increment('jobs_completed_total', labels)
+        if (event.type === 'failed') metrics.increment('jobs_failed_total', labels)
+        if (event.type === 'dead') metrics.increment('jobs_dead_total', labels)
+        if (event.durationMs !== undefined) {
+          metrics.observe('jobs_duration_ms', event.durationMs, labels)
+        }
       }
-    }
-    if (event.type === 'failed' || event.type === 'dead' || event.type === 'error') {
-      logger.error('job failure', { ...event })
-    }
-    reschedule(event)
-  },
+      if (event.type === 'failed' || event.type === 'dead' || event.type === 'error') {
+        logger.error('job failure', { ...event, network: plane.network })
+      }
+      reschedule(event)
+    },
+  })
+  registerHandlers(runner, {
+    sql: plane.db,
+    logger,
+    metrics,
+    signingSecret: env.outboxSigningSecret,
+    deploy: deployFor(plane.db, plane.network),
+    queue: plane.queue,
+    sweepLimit: 100,
+  })
+  return runner
 })
-
-registerHandlers(runner, {
-  sql: db,
-  logger,
-  metrics,
-  signingSecret: env.outboxSigningSecret,
-  deploy,
-  queue,
-  sweepLimit: 100,
-})
-await seedRecurring(queue, env.network)
-runner.start()
+for (const plane of planes) await seedRecurring(plane.queue, plane.network)
+for (const runner of runners) runner.start()
 
 // 10. Listen. Last of the construction steps, because a socket that accepts before its dependencies
 //     exist is a socket that answers 500.
@@ -358,12 +426,12 @@ lifecycle.markReady()
 //     safe but wastes a custody signature and a nonce read. Then the pool closes with nothing left
 //     to use it.
 lifecycle.onShutdown(async () => {
-  await sql.end({ timeout: 5 })
+  await Promise.all(planes.map((plane) => plane.pool.end({ timeout: 5 })))
   logger.info('database pool closed')
 })
 lifecycle.onShutdown(async () => {
-  const clean = await runner.stop(20_000)
-  logger.info('job runner stopped', { clean })
+  const clean = (await Promise.all(runners.map((r) => r.stop(20_000)))).every(Boolean)
+  logger.info('job runners stopped', { clean, runners: runners.length })
 })
 lifecycle.onShutdown(
   () =>

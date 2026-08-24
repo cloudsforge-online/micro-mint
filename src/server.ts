@@ -46,6 +46,8 @@ import {
 import type { IssuableAssetCode, Network } from '@cloudsforge/contracts-chain'
 import { userSubject } from '@cloudsforge/contracts-money'
 import type { Lifecycle } from '@cloudsforge/lifecycle'
+import { NetworkUnknownError, requestNetwork } from '@cloudsforge/http'
+import type { NetworkSql } from '@cloudsforge/db'
 import { Metrics, newRequestId, type Logger } from '@cloudsforge/telemetry'
 import type { JobQueue } from '@cloudsforge/jobs'
 import { chainKey, isChainId, isNetwork, type ChainId } from './chains.ts'
@@ -86,8 +88,22 @@ export interface ServerDeps {
   readonly logger: Logger
   readonly metrics: Metrics
   readonly verifier: PrincipalVerifier
-  readonly sql: Db
+  /**
+   * The per-network SELECTOR, not a handle. Routes use `ctx.sql`; `NetworkSql` has no query
+   * methods, so reaching for the process-wide handle does not compile.
+   */
+  readonly sql: NetworkSql
+  /**
+   * The network to assume when no `CF-Network` arrives, or `undefined` to refuse. `CF_NETWORK_SINGLE`,
+   * for `pnpm dev`, which has no gateway in front of it. Never set in production.
+   */
+  readonly singleNetwork?: Network
   readonly producer: string
+  /**
+   * The boot-time default, from `MINT_NETWORK`. `forRequest` replaces it with the network the
+   * gateway stamped, because a pod that serves both estates has no process-wide answer to
+   * "which chain am I deploying to" — and the old answer was the wrong one half the time.
+   */
   readonly network: Network
   readonly pay: PayDeps
   readonly render: RenderDeps
@@ -186,7 +202,34 @@ interface RequestContext {
   readonly requestId: string
   readonly log: Logger
   readonly params: Readonly<Record<string, string>>
+  /**
+   * The network THIS REQUEST belongs to, from the `CF-Network` header the gateway stamped.
+   *
+   * Not a property of the process: one pod serves both estates since the network consolidation
+   * (micro-deploy `docs/network-consolidation.md`), so "which network am I" has no answer.
+   */
+  readonly network: Network
+  /**
+   * The database handle for `network`, resolved ONCE, at the edge of the request.
+   *
+   * Every route uses this rather than reaching for the process-wide handle, because a wrong handle
+   * is not an error — it is a query that SUCCEEDS against the other estate's rows and says nothing.
+   * `deps.sql` is a `NetworkSql` with no query methods, so the mistake does not compile.
+   */
+  readonly sql: Db
 }
+
+/**
+ * Routes that answer without belonging to a network.
+ *
+ * Kubelet probes the first two and Prometheus scrapes the third; none arrives through the gateway,
+ * so none carries `CF-Network`. Refusing them turns a data-isolation rule into a CrashLoopBackOff —
+ * which is exactly what agora's first build did: 500 on every probe, container never ready.
+ *
+ * A literal SET rather than a prefix, because this is an exemption from a data boundary and
+ * widening it should be a deliberate edit. Every member must answer without touching the database.
+ */
+const OPERATIONAL_ROUTES: ReadonlySet<string> = new Set(['/livez', '/readyz', '/metrics'])
 
 interface Route {
   readonly method: string
@@ -254,23 +297,61 @@ export function createServer(deps: ServerDeps): Server {
     inFlight += 1
     deps.metrics.set('http_requests_in_flight', inFlight)
 
-    const finish = (status: number) => {
+    const finish = (status: number, metricNetwork: string) => {
       inFlight -= 1
       deps.metrics.set('http_requests_in_flight', inFlight)
       const durationMs = Number(process.hrtime.bigint() - startedAt) / 1e6
-      deps.metrics.increment('http_requests_total', { method, route: routeLabel, status: String(status) })
-      deps.metrics.observe('http_request_duration_ms', durationMs, { method, route: routeLabel })
+      deps.metrics.increment('http_requests_total', {
+        method,
+        route: routeLabel,
+        status: String(status),
+        // One target now serves both estates, so the network has to be on the SERIES. Labelled
+        // per target it would say nothing — micro-org#398 in a form nothing could recover.
+        network: metricNetwork,
+      })
+      deps.metrics.observe('http_request_duration_ms', durationMs, {
+        method,
+        route: routeLabel,
+        network: metricNetwork,
+      })
     }
 
-    void handle(matched, { req, url, requestId, log, params }, deps)
+    // ── THE NETWORK, THEN THE HANDLE, BEFORE ANY ROUTE RUNS ──────────────────────────────────
+    //
+    // `requestNetwork` REFUSES an unstamped request rather than assuming mainnet: a 500 is a
+    // routing fault made loud, where a default is a cross-network write nothing would ever flag.
+    //
+    // The operational endpoints are exempt because kubelet and Prometheus do not come through the
+    // gateway and never send the header. Refusing them makes the pod never become ready.
+    const networkless = matched !== undefined && OPERATIONAL_ROUTES.has(matched.path)
+    let network: Network
+    try {
+      network = networkless
+        ? (deps.singleNetwork ?? deps.sql.networks[0] ?? 'mainnet')
+        : requestNetwork(req.headers, deps.singleNetwork ? { fallback: deps.singleNetwork } : {})
+    } catch (err) {
+      log.error('request carries no usable network', {
+        err: err instanceof NetworkUnknownError ? err.message : err,
+      })
+      send(
+        res,
+        errorReply(500, 'network_unknown', 'this request could not be attributed to a network', requestId),
+        requestId,
+      )
+      finish(500, 'unknown')
+      return
+    }
+
+    const sql = deps.sql.for(network) as unknown as Db
+    void handle(matched, { req, url, requestId, log, params, network, sql }, forRequest(deps, network, sql))
       .then((reply) => {
         send(res, reply, requestId)
-        finish(reply.status)
+        finish(reply.status, network)
       })
       .catch((err: unknown) => {
         log.error('request handler threw after mapping', { err })
         send(res, errorReply(500, 'internal', 'the request could not be completed', requestId), requestId)
-        finish(500)
+        finish(500, network)
       })
   })
 }
@@ -289,6 +370,18 @@ export function createServer(deps: ServerDeps): Server {
  *     rolled back, and the caller's retry carries the same derived key. Retrying IS the right
  *     response, which is what 503 tells a client and 500 does not.
  */
+/**
+ * The deps a REQUEST sees.
+ *
+ * Two things move: the database handle, and the NETWORK ITSELF. mint is the first service where
+ * the second matters more than the first — `deps.network` chose which chain a deployment went to,
+ * so a testnet order served by a mainnet-configured pod would have deployed a real contract, paid
+ * real gas from custody, and recorded it against a testnet order.
+ */
+function forRequest(deps: ServerDeps, network: Network, sql: Db): ServerDeps {
+  return { ...deps, network, pay: { ...deps.pay, sql } }
+}
+
 async function handle(route: Route | undefined, ctx: RequestContext, deps: ServerDeps): Promise<Reply> {
   if (!route) {
     return errorReply(404, 'not_found', `no route for ${ctx.req.method} ${ctx.url.pathname}`, ctx.requestId)
@@ -452,7 +545,7 @@ function buildRoutes(): Route[] {
 
       const done = deps.lifecycle.track()
       try {
-        const token = await createToken(deps.sql, deps.producer, {
+        const token = await createToken(ctx.sql, deps.producer, {
           ownerSubject: userSubject(userId),
           ownerWalletId,
           ownerAddress,
@@ -482,7 +575,7 @@ function buildRoutes(): Route[] {
       if (principal.kind === 'service') requireScope(principal, READ_SCOPE)
       const requested = ctx.url.searchParams.get('userId') ?? undefined
       const userId = isAdmin(principal) && requested ? requested : subjectUserId(principal, requested)
-      const tokens = await listTokens(deps.sql, userSubject(userId), 100)
+      const tokens = await listTokens(ctx.sql, userSubject(userId), 100)
       return { status: 200, body: { tokens: tokens.map(toWire) } }
     }),
 
@@ -494,7 +587,7 @@ function buildRoutes(): Route[] {
       const principal = await authenticate(ctx, deps)
       if (principal.kind === 'service') requireScope(principal, READ_SCOPE)
       const token = await ownedToken(ctx, deps, principal)
-      const attempts = await listAttempts(deps.sql, token.id)
+      const attempts = await listAttempts(ctx.sql, token.id)
       return {
         status: 200,
         body: {
@@ -611,7 +704,7 @@ function buildRoutes(): Route[] {
       if (principal.kind === 'service') requireScope(principal, WRITE_SCOPE)
       const token = await ownedToken(ctx, deps, principal)
       const body = await readJson(ctx.req)
-      const page = await upsertProjectPage(deps.sql, {
+      const page = await upsertProjectPage(ctx.sql, {
         tokenId: token.id,
         subject: token.ownerSubject,
         description: stringOrUndefined(body['description']) ?? '',
@@ -670,7 +763,7 @@ function buildRoutes(): Route[] {
       if (!UUID.test(eventId)) throw new BadRequestError('the event id must be a uuid')
       if (!SUBSCRIBED_TOPICS.has(topic)) return { status: 202, body: { status: 'ignored' } }
 
-      const outcome = await withInbox(deps.sql, topic, eventId, async (tx) => {
+      const outcome = await withInbox(ctx.sql, topic, eventId, async (tx) => {
         // Rule 6 of docs/ecosystem/03 §2. The whole decision — which rows go, which are
         // anonymised, and the lawful basis for every one that stays — is in `erasure.ts`, in the
         // code rather than in a document that can drift away from it.
@@ -724,8 +817,8 @@ async function ownedToken(
 ): Promise<TokenRecord> {
   const id = tokenIdOf(ctx)
   const token = isAdmin(principal)
-    ? await findToken(deps.sql, id)
-    : await findOwnedToken(deps.sql, id, userSubject(subjectUserId(principal, undefined)))
+    ? await findToken(ctx.sql, id)
+    : await findOwnedToken(ctx.sql, id, userSubject(subjectUserId(principal, undefined)))
   if (!token) throw new OrderStateError('no such token', 'not_found')
   return token
 }
