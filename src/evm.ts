@@ -27,7 +27,7 @@
  *      us, which is the one condition under which a deploy must be failed rather than confirmed.
  */
 
-import { keccak256 } from './keccak.ts'
+import { keccak256, toChecksumAddress } from '@cloudsforge/evm'
 import { ChainError } from './chains.ts'
 
 const EVM_SHAPE = /^0x[0-9a-fA-F]{40}$/
@@ -35,25 +35,6 @@ const HEX_QUANTITY = /^0x[0-9a-fA-F]+$/
 export const ZERO_ADDRESS = '0x0000000000000000000000000000000000000000'
 
 /* ------------------------------------------------------------------ addresses */
-
-/**
- * EIP-55 checksum encoding.
- *
- * The hex digits of the lower-cased address are upper-cased where the corresponding nibble of
- * `keccak256(lowercase address without 0x)` is 8 or above. That is the entire specification, and it
- * is the only typo protection a 20-byte EVM address has.
- */
-export function toChecksumAddress(address: string): string {
-  const lower = address.toLowerCase().replace(/^0x/, '')
-  const hash = Buffer.from(keccak256(Buffer.from(lower, 'ascii'))).toString('hex')
-  let out = '0x'
-  for (let i = 0; i < lower.length; i++) {
-    const character = lower[i]!
-    // Digits have no case, so only letters are touched.
-    out += Number.parseInt(hash[i]!, 16) >= 8 ? character.toUpperCase() : character
-  }
-  return out
-}
 
 /**
  * Validate and produce the display form, or throw.
@@ -283,3 +264,12 @@ export function gasPriceBid(quoted: bigint, bounds: FeeBounds): bigint {
 
 /** The JSON-RPC transport. The seam every test substitutes; the adapter above it is the real one. */
 export type JsonRpc = (method: string, params: readonly unknown[]) => Promise<unknown>
+
+/**
+ * EIP-55 checksum encoding, from `@cloudsforge/evm`.
+ *
+ * Re-exported so callers keep importing it from here. The implementation moved out
+ * because five services held a byte-identical copy, and a checksum computed two ways
+ * is a withdrawal refused for an address copied out of our own UI.
+ */
+export { toChecksumAddress }

@@ -10,7 +10,7 @@ import assert from 'node:assert/strict'
 import test from 'node:test'
 import { createHash } from 'node:crypto'
 import { readFileSync } from 'node:fs'
-import { keccak256 } from './keccak.ts'
+import { keccak256 } from '@cloudsforge/evm'
 import {
   canonicaliseEvm,
   createAddress,
